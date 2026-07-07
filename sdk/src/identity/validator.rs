@@ -63,6 +63,7 @@ impl AsyncPostValidator for CawgValidator {
 /// that custom `cawg_trust.user_anchors` are consulted during X.509
 /// identity certificate trust verification.
 pub struct CawgValidatorWithSettings {
+    /// Settings used to resolve caller-provided CAWG trust anchors.
     pub settings: Settings,
 }
 
