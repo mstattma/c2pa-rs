@@ -730,9 +730,10 @@ where
     Ok(exclusions)
 }
 
-// `iloc`, `stco`, `co64`, `mfro`, `saio`, `sidx`, `tdhd`, and `tfra` elements contain absolute file offsets so they need to be adjusted based on whether content was added or removed.
+// `iloc`, `stco`, `co64`, `saio`, `tfhd`, and `tfra` elements contain absolute file offsets so they need to be adjusted based on whether content was added or removed.
+// (`mfro` stores the mfra box size and `sidx` offsets are relative to an anchor point, so neither is patched here.)
 fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
-    mut output: &mut W,
+    output: &mut W,
     bmff_tree: &Arena<BoxInfo>,
     bmff_path_map: &HashMap<String, Vec<Token>>,
     adjust: i32,
@@ -1058,9 +1059,6 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
         }
     }
 
-    // map to store track to moof mapping
-    let mut track_id_to_moof_mapping = HashMap::new();
-
     // handle moof traf tfhd
     if let Some(tfhd_list) = bmff_path_map.get("/moof/traf/tfhd") {
         for tfhd_token in tfhd_list {
@@ -1083,15 +1081,7 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
             let (_version, tf_flags) = read_box_header_ext(output)?; // box extensions
 
             // track ID
-            let track_id = output.read_u32::<BigEndian>()?;
-
-            // get to outter moof box
-            let ancestors = tfhd_token.ancestors(bmff_tree);
-            for ancestor in ancestors {
-                if ancestor.data.path == "moof" {
-                    track_id_to_moof_mapping.insert(track_id, ancestor.data.offset);
-                }
-            }
+            let _track_id = output.read_u32::<BigEndian>()?;
 
             // fix up base offset and write out if flags indicate to do so
             if tf_flags & 1 == 1 {
@@ -1126,7 +1116,7 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
                 return Err(Error::InvalidAsset("Bad BMFF".to_string()));
             }
 
-            // read iloc box and patch
+            // read tfra box and patch
             output.seek(SeekFrom::Start(tfra_box_info.offset))?;
 
             // read header
@@ -1138,9 +1128,14 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
 
             // read extended header
             let (version, _flags) = read_box_header_ext(output)?; // box extensions
+            if version > 1 {
+                return Err(Error::InvalidAsset(
+                    "Bad BMFF: unknown tfra version".to_string(),
+                ));
+            }
 
             // track ID
-            let track_id = output.read_u32::<BigEndian>()?;
+            let _track_id = output.read_u32::<BigEndian>()?;
 
             // tfr flags
             let tfra_info = output.read_u32::<BigEndian>()?;
@@ -1151,38 +1146,57 @@ fn adjust_known_offsets<W: Write + CAIRead + ?Sized>(
             // num entries
             let num_entries = output.read_u32::<BigEndian>()?;
 
-            // get the moof boxes
-            // fix up the offsets in the entry list
+            // The tfra box is a random access table (ISO 14496-12 8.8.10): each entry
+            // maps a presentation time to the absolute file offset of the moof box
+            // containing that sync sample. Entries are not 1:1 with moof boxes — a
+            // fragment with several sync samples appears multiple times, one without
+            // any doesn't appear at all — so the table cannot be rebuilt from the
+            // moof list. Since inserting/removing the manifest shifts every moof by
+            // exactly `adjust` bytes without reordering them, the stored offsets stay
+            // valid relative to each other: rewrite each entry as its own old offset
+            // plus `adjust`, the same fix-up applied to stco/co64/saio above.
+            // Per ISO 14496-12 8.8.10, each entry is laid out as:
+            //   time         u64 for version 1, u32 for version 0
+            //   moof_offset  u64 for version 1, u32 for version 0
+            //   traf_number, trun_number, sample_number
+            //                (length_size_of_*_num + 1) bytes each, per the
+            //                2-bit size codes parsed from tfra_info above
+            // Only moof_offset needs patching: read past time, read the offset,
+            // step back over the offset just read and rewrite it in place, then
+            // skip the three trailing number fields to land on the next entry.
+
+            // byte width of the time and moof_offset fields per tfra version
+            const TFRA_V1_FIELD_SIZE: i64 = 8; // u64
+            const TFRA_V0_FIELD_SIZE: i64 = 4; // u32
+
+            // combined width of the traf/trun/sample number fields
+            let trailing_number_fields_size =
+                (length_size_of_traf_num + length_size_of_trun_num + length_size_of_sample_num + 3)
+                    as i64;
+
             for _entries in 0..num_entries {
                 if version == 1 {
                     let _time = output.read_u64::<BigEndian>()?;
-
-                    // write out mapped value of the moof position for this track
-                    let moof_offset = track_id_to_moof_mapping
-                        .get(&track_id)
-                        .ok_or(Error::InvalidAsset("Bad BMFF".to_string()))?;
-                    output.write_u64::<BigEndian>(*moof_offset)?;
+                    let moof_offset = output.read_u64::<BigEndian>()?;
+                    let new_offset = moof_offset.checked_add_signed(adjust as i64).ok_or(
+                        Error::InvalidAsset("Bad BMFF offset adjustment".to_string()),
+                    )?;
+                    output.seek(SeekFrom::Current(-TFRA_V1_FIELD_SIZE))?;
+                    output.write_u64::<BigEndian>(new_offset)?;
                 } else {
                     let _time = output.read_u32::<BigEndian>()?;
-
-                    // write out mapped value of the moof position for this track
-                    let moof_offset_u64 = track_id_to_moof_mapping
-                        .get(&track_id)
-                        .ok_or(Error::InvalidAsset("Bad BMFF".to_string()))?;
-
-                    let moof_offset = u32::try_from(*moof_offset_u64).map_err(|_e| {
-                        Error::InvalidAsset("Bad BMFF offset adjustment".to_string())
-                    })?;
-                    output.write_u32::<BigEndian>(moof_offset)?;
+                    let moof_offset = output.read_u32::<BigEndian>()?;
+                    let new_offset =
+                        moof_offset
+                            .checked_add_signed(adjust)
+                            .ok_or(Error::InvalidAsset(
+                                "Bad BMFF offset adjustment".to_string(),
+                            ))?;
+                    output.seek(SeekFrom::Current(-TFRA_V0_FIELD_SIZE))?;
+                    output.write_u32::<BigEndian>(new_offset)?;
                 }
 
-                // read extra stuff to move the position
-                let traf_num_bytes = length_size_of_traf_num + 1;
-                output.read_to_vec(traf_num_bytes as u64)?;
-                let trun_num_bytes = length_size_of_trun_num + 1;
-                output.read_to_vec(trun_num_bytes as u64)?;
-                let sample_num_bytes = length_size_of_sample_num + 1;
-                output.read_to_vec(sample_num_bytes as u64)?;
+                output.seek(SeekFrom::Current(trailing_number_fields_size))?;
             }
         }
     }
@@ -2914,6 +2928,116 @@ pub mod tests {
             }
         }
         assert!(success)
+    }
+
+    // Minimal BMFF box walker: returns (box_type, offset, size, header_size)
+    // for each box in the byte range [start, end), handling the size == 1
+    // (64-bit largesize, 16-byte header) and size == 0 (extends to end of
+    // range) encodings. Called on the whole file it lists top-level boxes;
+    // called on a container's interior (offset + header .. offset + size) it
+    // lists that box's children. Malformed sizes end the scan early.
+    //
+    // Deliberately independent of the production build_bmff_tree parser:
+    // that parser is part of the code under test, and measuring its output
+    // through itself could hide a shared parsing bug. This helper is the
+    // test's oracle, so it re-implements the header walk from the spec.
+    fn scan_boxes(data: &[u8], start: usize, end: usize) -> Vec<(String, usize, usize, usize)> {
+        let mut boxes = Vec::new();
+        let mut off = start;
+        while off + 8 <= end {
+            let size32 = u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+            let box_type = String::from_utf8_lossy(&data[off + 4..off + 8]).to_string();
+            let (size, hdr) = match size32 {
+                0 => (end - off, 8),
+                1 if off + 16 <= end => (
+                    u64::from_be_bytes(data[off + 8..off + 16].try_into().unwrap()) as usize,
+                    16,
+                ),
+                _ => (size32, 8),
+            };
+            // stop on malformed sizes rather than panicking or looping forever
+            if size < hdr || off + size > end {
+                break;
+            }
+            boxes.push((box_type, off, size, hdr));
+            off += size;
+        }
+        boxes
+    }
+
+    fn top_level_moof_offsets(data: &[u8]) -> Vec<u64> {
+        scan_boxes(data, 0, data.len())
+            .into_iter()
+            .filter(|(t, ..)| t == "moof")
+            .map(|(_, o, ..)| o as u64)
+            .collect()
+    }
+
+    fn tfra_entry_moof_offsets(data: &[u8]) -> Vec<u64> {
+        let mut offsets = Vec::new();
+        for (box_type, off, size, hdr) in scan_boxes(data, 0, data.len()) {
+            if box_type != "mfra" {
+                continue;
+            }
+            for (child_type, c_off, _c_size, c_hdr) in scan_boxes(data, off + hdr, off + size) {
+                if child_type != "tfra" {
+                    continue;
+                }
+                let mut p = c_off + c_hdr;
+                let version = data[p];
+                p += 4; // version + flags
+                p += 4; // track ID
+                let fields = u32::from_be_bytes(data[p..p + 4].try_into().unwrap());
+                let skip_len =
+                    (((fields >> 4) & 3) + ((fields >> 2) & 3) + (fields & 3)) as usize + 3;
+                p += 4;
+                let entry_count = u32::from_be_bytes(data[p..p + 4].try_into().unwrap());
+                p += 4;
+                for _ in 0..entry_count {
+                    if version == 1 {
+                        p += 8; // time
+                        offsets.push(u64::from_be_bytes(data[p..p + 8].try_into().unwrap()));
+                        p += 8;
+                    } else {
+                        p += 4; // time
+                        offsets.push(u32::from_be_bytes(data[p..p + 4].try_into().unwrap()) as u64);
+                        p += 4;
+                    }
+                    p += skip_len; // traf/trun/sample number fields
+                }
+            }
+        }
+        offsets
+    }
+
+    #[test]
+    fn test_fragmented_write_adjusts_each_tfra_entry() {
+        let source = fixture_path("fragmented_mfra.mp4");
+
+        let source_data = std::fs::read(&source).unwrap();
+        let source_moofs = top_level_moof_offsets(&source_data);
+        let source_tfra = tfra_entry_moof_offsets(&source_data);
+        assert!(
+            source_moofs.len() > 1,
+            "fixture must contain multiple fragments"
+        );
+        assert_eq!(source_tfra, source_moofs);
+
+        let temp_dir = tempdirectory().unwrap();
+        let output = temp_dir_path(&temp_dir, "fragmented_mfra_out.mp4");
+        std::fs::copy(&source, &output).unwrap();
+
+        let bmff = BmffIO::new("mp4");
+        bmff.save_cai_store(&output, "some test data".as_bytes())
+            .unwrap();
+
+        // every tfra entry must still reference its own (shifted) moof box,
+        // not a single collapsed offset
+        let output_data = std::fs::read(&output).unwrap();
+        let output_moofs = top_level_moof_offsets(&output_data);
+        let output_tfra = tfra_entry_moof_offsets(&output_data);
+        assert_eq!(output_moofs.len(), source_moofs.len());
+        assert_eq!(output_tfra, output_moofs);
     }
 
     #[test]
