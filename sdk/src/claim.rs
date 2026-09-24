@@ -992,7 +992,8 @@ impl Claim {
         if let Some(md) = self.metadata() {
             claim_map.serialize_field(METADATA_F, md)?;
         }
-        if let Some(spec_version) = self.spec_version() {
+        // Match the field counted above; the getter may return the CGI's specVersion instead.
+        if let Some(spec_version) = &self.spec_version {
             claim_map.serialize_field(SPEC_VERSION_F, spec_version)?;
         }
 
@@ -5678,6 +5679,40 @@ pub mod tests {
                     == Some(validation_status::CLAIM_MALFORMED)),
             "should log CLAIM_MALFORMED"
         );
+    }
+
+    #[test]
+    fn test_spec_version_v2_cbor_roundtrip() {
+        for (legacy, generator) in [
+            (None, None),
+            (None, Some("2.4.0")),
+            (Some("2.3.0"), None),
+            (Some("2.3.0"), Some("2.4.0")),
+        ] {
+            let mut claim = Claim::new("test", Some("test"), 2);
+            let mut info = ClaimGeneratorInfo::new("test app");
+            info.spec_version = generator.map(str::to_owned);
+            claim.add_claim_generator_info(info.clone());
+            claim.set_spec_version(legacy.map(str::to_owned));
+
+            let bytes = c2pa_cbor::to_vec(&claim).unwrap();
+            let value: c2pa_cbor::Value = c2pa_cbor::from_slice(&bytes)
+                .expect("serialized claim must be exactly one complete CBOR map");
+            assert_eq!(
+                map_cbor_to_type::<String>(SPEC_VERSION_F, &value).as_deref(),
+                legacy
+            );
+            assert_eq!(
+                map_cbor_to_type::<ClaimGeneratorInfo>(CLAIM_GENERATOR_INFO_F, &value),
+                Some(info.clone())
+            );
+
+            let restored = Claim::from_data(claim.label(), &bytes).unwrap();
+            assert_eq!(restored.spec_version.as_deref(), legacy);
+            assert_eq!(restored.claim_generator_info().unwrap(), &[info]);
+            // Serialize the fields again, rather than replaying cached original_bytes.
+            assert_eq!(c2pa_cbor::to_vec(&restored).unwrap(), bytes);
+        }
     }
 
     #[test]
