@@ -2314,7 +2314,8 @@ pub unsafe extern "C" fn c2pa_manifest_bytes_free(manifest_bytes_ptr: *const c_u
 ///
 /// # Arguments
 ///
-/// * `builder_ptr` - the builder to sign with; consumed by this call.
+/// * `builder_ptr` - the builder to sign with. Borrowed: the caller still
+///   owns it and must free it with [`c2pa_builder_free`].
 /// * `signer_ptr` - the signer to use.
 /// * `sources` - array of `count` null-terminated UTF-8 paths, one per
 ///   rendition. Each must be a single-file fragmented BMFF (its own `moov`

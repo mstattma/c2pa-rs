@@ -439,6 +439,108 @@ fn ladder_rejects_mixed_and_overlapping_input() {
     assert!(error.contains("existing Merkle boxes"), "{error}");
 }
 
+#[test]
+fn ladder_rejects_overlap_by_file_identity_not_by_spelling() {
+    let dir = tempfile::tempdir().unwrap();
+    let subdir = dir.path().join("subdir");
+    std::fs::create_dir(&subdir).unwrap();
+    let source_a = dir.path().join("a.mp4");
+    std::fs::write(&source_a, rendition(RELATIVE, 1)).unwrap();
+    let source_b = dir.path().join("b.mp4");
+    std::fs::write(&source_b, rendition(RELATIVE, 2)).unwrap();
+    let sources = [source_a.clone(), source_b.clone()];
+    let untouched = |path: &PathBuf, seed: u8| {
+        assert_eq!(std::fs::read(path).unwrap(), rendition(RELATIVE, seed));
+    };
+
+    let fail = |sources: &[PathBuf], outputs: &[PathBuf]| -> String {
+        builder()
+            .sign_ladder_files(test_signer(SigningAlg::Es256).as_ref(), sources, outputs)
+            .unwrap_err()
+            .to_string()
+    };
+
+    // `subdir/../a.mp4` is a different string but the same file as `a.mp4`:
+    // a spelling check lets the writer read a rendition while truncating it.
+    let alias_of_a = subdir.join("..").join("a.mp4");
+    let error = fail(&sources, &[alias_of_a, dir.path().join("out_b.mp4")]);
+    assert!(
+        error.contains("must not be any rendition's input"),
+        "{error}"
+    );
+    untouched(&source_a, 1);
+
+    // The other rendition's input, aliased, is just as much an input.
+    let alias_of_b = subdir.join("..").join("b.mp4");
+    let error = fail(&sources, &[alias_of_b, dir.path().join("out_b.mp4")]);
+    assert!(
+        error.contains("must not be any rendition's input"),
+        "{error}"
+    );
+    untouched(&source_b, 2);
+
+    // A hard link is a second name for the source's inode, and no amount of
+    // path comparison sees through it.
+    let link_of_a = dir.path().join("link_of_a.mp4");
+    std::fs::hard_link(&source_a, &link_of_a).unwrap();
+    let error = fail(&sources, &[link_of_a, dir.path().join("out_b.mp4")]);
+    assert!(
+        error.contains("same file as a rendition's input"),
+        "{error}"
+    );
+    untouched(&source_a, 1);
+
+    // Two spellings of one output would collapse the ladder into one file.
+    let out = dir.path().join("out.mp4");
+    let error = fail(&sources, &[out.clone(), subdir.join("..").join("out.mp4")]);
+    assert!(
+        error.contains("every rendition needs its own output path"),
+        "{error}"
+    );
+
+    // ...as would two outputs that are hard links of one another.
+    let out_x = dir.path().join("x.mp4");
+    std::fs::write(&out_x, b"").unwrap();
+    let out_y = dir.path().join("y.mp4");
+    std::fs::hard_link(&out_x, &out_y).unwrap();
+    let error = fail(&sources, &[out_x, out_y]);
+    assert!(error.contains("hard links of one another"), "{error}");
+
+    // A dangling symlink named like an output would send the write to its
+    // target -- here the other rendition's output, collapsing the ladder.
+    #[cfg(unix)]
+    {
+        let out_y = dir.path().join("dangling_target.mp4");
+        let out_x = dir.path().join("dangling.mp4");
+        std::os::unix::fs::symlink(&out_y, &out_x).unwrap();
+        let error = fail(&sources, &[out_x, out_y]);
+        assert!(
+            error.contains("symlink to a file that does not exist"),
+            "{error}"
+        );
+    }
+
+    // The checks resolve, they do not forbid, relative spellings: an output
+    // that only does not exist yet is fine when named through `..`.
+    let fresh = subdir.join("..").join("fresh_a.mp4");
+    builder()
+        .sign_ladder_files(
+            test_signer(SigningAlg::Es256).as_ref(),
+            &sources,
+            &[fresh, dir.path().join("fresh_b.mp4")],
+        )
+        .unwrap();
+    assert_eq!(
+        maps(&binding(
+            &std::fs::read(dir.path().join("fresh_a.mp4")).unwrap()
+        ))
+        .len(),
+        2
+    );
+    untouched(&source_a, 1);
+    untouched(&source_b, 2);
+}
+
 struct DynamicSigner(Box<dyn Signer>);
 struct Dynamic;
 impl DynamicAssertion for Dynamic {

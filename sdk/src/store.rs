@@ -3172,29 +3172,6 @@ impl Store {
         Ok(())
     }
 
-    /// Sign the renditions of one ABR ladder into a single claim.
-    ///
-    /// Every input must be a *single-file* fragmented BMFF asset: one file that
-    /// holds `ftyp`, `moov` and every `moof`/`mdat` pair, rather than an init
-    /// segment plus a directory of segment files (that layout is
-    /// [`Self::save_to_bmff_fragmented`]). The renditions of a ladder are
-    /// different encodes of the same content, so one claim covers the set: the
-    /// single `c2pa.hash.bmff.v3` assertion carries one `MerkleMap` per
-    /// rendition -- `uniqueId` `0..N-1` in the order given here, each with its
-    /// own `initHash` and its own leaf row -- and the identical signed manifest
-    /// is embedded in every output. Each output's `merkle` UUID boxes carry
-    /// that rendition's `uniqueId`, which is how a reader picks the one map
-    /// that describes the file in front of it; `localId` cannot do that,
-    /// because splitting a multiplexed source renumbers every track to 1.
-    ///
-    /// A one-rung ladder is exactly a single-asset signing: `uniqueId` 0 is
-    /// [`SINGLE_RENDITION_ID`].
-    ///
-    /// `outputs` must be the same length as `inputs`, must be distinct, and
-    /// must not name any of the inputs. The manifest is always embedded, so
-    /// remote and sidecar manifests are refused. Returns the JUMBF manifest
-    /// that was written to every rendition.
-    #[cfg(feature = "file_io")]
     /// Patch an already-written manifest box in place, without the
     /// whole-file-rewrite fallback that `save_jumbf_to_file` performs.
     ///
@@ -3215,6 +3192,31 @@ impl Store {
         patcher.patch_cai_store(path, jumbf)
     }
 
+    /// Sign the renditions of one ABR ladder into a single claim.
+    ///
+    /// Every input must be a *single-file* fragmented BMFF asset: one file that
+    /// holds `ftyp`, `moov` and every `moof`/`mdat` pair, rather than an init
+    /// segment plus a directory of segment files (that layout is
+    /// [`Self::save_to_bmff_fragmented`]). The renditions of a ladder are
+    /// different encodes of the same content, so one claim covers the set: the
+    /// single `c2pa.hash.bmff.v3` assertion carries one `MerkleMap` per
+    /// rendition -- `uniqueId` `1..=N` in the order given here, each with its
+    /// own `initHash` and its own leaf row -- and the identical signed manifest
+    /// is embedded in every output. Each output's `merkle` UUID boxes carry
+    /// that rendition's `uniqueId`, which is how a reader picks the one map
+    /// that describes the file in front of it; `localId` cannot do that,
+    /// because splitting a multiplexed source renumbers every track to 1.
+    ///
+    /// A one-rung ladder is exactly a single-asset signing: `uniqueId` 1 is
+    /// [`SINGLE_RENDITION_ID`].
+    ///
+    /// `outputs` must be the same length as `inputs`, must be distinct files,
+    /// and none may be an input -- judged by resolved path and, where the file
+    /// exists, by identity, so aliases and hard links are refused too. The
+    /// manifest is always embedded, so
+    /// remote and sidecar manifests are refused. Returns the JUMBF manifest
+    /// that was written to every rendition.
+    #[cfg(feature = "file_io")]
     pub fn save_to_bmff_ladder(
         &mut self,
         inputs: &[PathBuf],
@@ -3249,18 +3251,74 @@ impl Store {
 
         // Each rendition is read while its own output is written, and the
         // outputs are patched again after signing, so they may not overlap.
-        let mut destinations = HashSet::new();
-        for output in outputs {
-            if !destinations.insert(output) {
-                return Err(Error::BadParam(
-                    "every rendition needs its own output path".to_string(),
-                ));
+        // Overlap is a property of files, not of spellings: `sub/../x.mp4`
+        // IS `x.mp4`, and a hard link is a second name for one inode. So
+        // compare canonical paths -- an output need not exist yet, so its
+        // parent is canonicalized and the file name re-joined -- and, for
+        // anything that already exists, file identity.
+        {
+            fn canonical_output(path: &Path) -> Result<PathBuf> {
+                if path.exists() {
+                    return Ok(std::fs::canonicalize(path)?);
+                }
+                // `exists()` follows symlinks, so a dangling one looks like a
+                // fresh output while the write would land wherever it points
+                // -- possibly on another rendition's output.
+                if std::fs::symlink_metadata(path).is_ok() {
+                    return Err(Error::BadParam(format!(
+                        "output {} is a symlink to a file that does not exist",
+                        path.display()
+                    )));
+                }
+                let parent = match path.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p,
+                    _ => Path::new("."),
+                };
+                let name = path.file_name().ok_or_else(|| {
+                    Error::BadParam("an output path must name a file".to_string())
+                })?;
+                Ok(std::fs::canonicalize(parent)?.join(name))
             }
-        }
-        if inputs.iter().any(|input| destinations.contains(input)) {
-            return Err(Error::BadParam(
-                "a rendition's output path must not be any rendition's input".to_string(),
-            ));
+
+            let canonical_inputs = inputs
+                .iter()
+                .map(std::fs::canonicalize)
+                .collect::<std::io::Result<Vec<PathBuf>>>()?;
+            let input_handles = inputs
+                .iter()
+                .map(same_file::Handle::from_path)
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let mut destinations: HashSet<PathBuf> = HashSet::new();
+            let mut destination_handles: Vec<same_file::Handle> = Vec::new();
+            for output in outputs {
+                let canonical = canonical_output(output)?;
+                if !destinations.insert(canonical.clone()) {
+                    return Err(Error::BadParam(
+                        "every rendition needs its own output path".to_string(),
+                    ));
+                }
+                if canonical_inputs.contains(&canonical) {
+                    return Err(Error::BadParam(
+                        "a rendition's output path must not be any rendition's input".to_string(),
+                    ));
+                }
+                if output.exists() {
+                    let handle = same_file::Handle::from_path(output)?;
+                    if input_handles.contains(&handle) {
+                        return Err(Error::BadParam(
+                        "a rendition's output is the same file as a rendition's input (a hard link)"
+                            .to_string(),
+                    ));
+                    }
+                    if destination_handles.contains(&handle) {
+                        return Err(Error::BadParam(
+                            "two renditions' outputs are the same file (hard links of one another)"
+                                .to_string(),
+                        ));
+                    }
+                    destination_handles.push(handle);
+                }
+            }
         }
 
         {
