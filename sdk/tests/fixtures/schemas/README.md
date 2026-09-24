@@ -4,7 +4,7 @@
 `isUpdateManifest` and `isCompressedManifest`.
 
 `crJSON-2.4-schema.json` is the published C2PA 2.4 crJSON schema extracted from
-the schema block in the [published crJSON specification](https://spec.c2pa.org/specifications/specifications/2.4/specs/crjson-format.html).
+the schema block in the [published crJSON specification](https://spec.c2pa.org/specifications/specifications/2.4/crJSON/crjson-format.html).
 It is vendored without changes from the reviewed schema fixture, including its
 lack of a trailing newline. SHA-256:
 

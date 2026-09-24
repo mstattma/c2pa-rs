@@ -721,7 +721,7 @@ impl Reader {
     }
 
     /// Get the manifest store as a crJSON [`Value`](serde_json::Value) using the
-    /// [published 2.4 schema](https://spec.c2pa.org/specifications/specifications/2.4/specs/crjson-format.html).
+    /// [published 2.4 schema](https://spec.c2pa.org/specifications/specifications/2.4/crJSON/crjson-format.html).
     ///
     /// Unlike [`Self::to_crjson_value`], this omits the post-2.4 manifest wrapper
     /// fields `isUpdateManifest` and `isCompressedManifest`, even when true.
