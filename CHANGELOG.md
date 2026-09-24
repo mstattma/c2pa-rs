@@ -9,6 +9,10 @@ As of December 2025 and until the 1.0.0 version is released, the CAI team will o
 
 ## [Unreleased]
 
+### Added
+
+* Add checked `Reader::to_crjson_value_published_2_4` export for the published crJSON 2.4 shape, omitting the two newer manifest flags while preserving default/latest exports.
+
 ### Fixed
 
 * Report the native C2PA validator version in crJSON `validationResults.specVersion`, rather than a serialization-format version.
