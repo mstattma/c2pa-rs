@@ -2305,6 +2305,97 @@ pub unsafe extern "C" fn c2pa_manifest_bytes_free(manifest_bytes_ptr: *const c_u
     cimpl_free!(manifest_bytes_ptr);
 }
 
+/// Sign an ABR ladder of single-file fragmented BMFF assets into ONE manifest.
+///
+/// Every rendition of a ladder shares one claim: the assertion carries one
+/// Merkle tree per rendition and the identical manifest is embedded into each
+/// output file, so the set validates together and a watermark that resolves to
+/// the session resolves to a single manifest rather than one per rendition.
+///
+/// # Arguments
+///
+/// * `builder_ptr` - the builder to sign with; consumed by this call.
+/// * `signer_ptr` - the signer to use.
+/// * `sources` - array of `count` null-terminated UTF-8 paths, one per
+///   rendition. Each must be a single-file fragmented BMFF (its own `moov`
+///   and `moof`); a multiplexed or non-fragmented asset is rejected.
+/// * `dests` - array of `count` null-terminated UTF-8 output paths, positionally
+///   matched to `sources`. Must be distinct and must not alias a source.
+/// * `count` - number of renditions; must be greater than zero.
+/// * `manifest_bytes_ptr` - out-pointer receiving the manifest embedded in
+///   every rendition. Released with [`c2pa_free`].
+///
+/// # Safety
+///
+/// Reads `count` entries from each array and each entry as a NULL-terminated C
+/// string. `builder_ptr` and `signer_ptr` must point to valid, non-freed
+/// instances.
+///
+/// # Returns
+///
+/// The length of the manifest bytes on success, or `-1` on error.
+#[cfg(feature = "file_io")]
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_builder_sign_ladder(
+    builder_ptr: *mut C2paBuilder,
+    signer_ptr: *mut C2paSigner,
+    sources: *const *const c_char,
+    dests: *const *const c_char,
+    count: usize,
+    manifest_bytes_ptr: *mut *const c_uchar,
+) -> i64 {
+    let builder = deref_mut_or_return_int!(builder_ptr, C2paBuilder);
+    let c2pa_signer = deref_mut_or_return_int!(signer_ptr, C2paSigner);
+    ptr_or_return_int!(manifest_bytes_ptr);
+
+    if count == 0 {
+        CimplError::other("a ladder needs at least one rendition").set_last();
+        return -1;
+    }
+    if sources.is_null() || dests.is_null() {
+        CimplError::other("sources or dests pointer is null").set_last();
+        return -1;
+    }
+
+    // Unpack both arrays before touching the builder, so a malformed argument
+    // cannot consume it.
+    let unpack = |array: *const *const c_char, name: &str| -> Option<Vec<std::path::PathBuf>> {
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let entry_ptr = *array.add(i);
+            if entry_ptr.is_null() {
+                CimplError::other(format!("{name}[{i}] is a null pointer")).set_last();
+                return None;
+            }
+            match std::ffi::CStr::from_ptr(entry_ptr).to_str() {
+                Ok(s) => out.push(std::path::PathBuf::from(s)),
+                Err(_) => {
+                    CimplError::other(format!("{name}[{i}] is not valid UTF-8")).set_last();
+                    return None;
+                }
+            }
+        }
+        Some(out)
+    };
+
+    let Some(source_paths) = unpack(sources, "sources") else {
+        return -1;
+    };
+    let Some(dest_paths) = unpack(dests, "dests") else {
+        return -1;
+    };
+
+    // Unlike the segmented entry point there is no read-back step: the ladder
+    // writer returns the manifest it embedded in every rendition.
+    let sign_result =
+        builder.sign_ladder_files(c2pa_signer.signer.as_ref(), &source_paths, &dest_paths);
+    let manifest_bytes = ok_or_return_int!(sign_result);
+
+    let len = manifest_bytes.len() as i64;
+    *manifest_bytes_ptr = to_c_bytes(manifest_bytes);
+    len
+}
+
 /// Sign a fragmented BMFF asset set (init segment + media fragments).
 ///
 /// Wraps [`c2pa::Builder::sign_fragmented_files`]. The output directory
