@@ -195,7 +195,9 @@ impl Store {
                 );
 
                 if let Some(al) = &anchor.allowed_list {
-                    let _v = store.add_trust_allowed_list(al.as_bytes());
+                    let _v = store
+                        .ctp
+                        .add_end_entity_credentials_for(al.as_bytes(), anchor.trust_kind.clone());
                 }
             }
         }
@@ -250,10 +252,6 @@ impl Store {
     pub fn add_trust_config(&mut self, trust_vec: &[u8]) -> Result<()> {
         self.ctp.add_valid_ekus(trust_vec);
         Ok(())
-    }
-
-    pub fn add_trust_allowed_list(&mut self, allowed_vec: &[u8]) -> Result<()> {
-        Ok(self.ctp.add_end_entity_credentials(allowed_vec)?)
     }
 
     /// Get the provenance if available.
@@ -10662,5 +10660,88 @@ pub mod tests {
         let _store = Store::from_stream(format, &mut stream, &mut log, &context).unwrap();
 
         assert!(!log.has_any_error());
+    }
+
+    #[test]
+    fn manifest_trust_purpose_and_reporting_are_isolated() {
+        let roots = include_str!("../tests/fixtures/certs/trust/test_cert_root_bundle.pem");
+        let asset = include_bytes!("../tests/fixtures/C.jpg");
+        let context = Context::new();
+        let (bytes, _) =
+            Store::load_jumbf_from_stream("image/jpeg", &mut Cursor::new(asset), &context).unwrap();
+        let store = Store::from_jumbf(&bytes, &mut StatusTracker::default()).unwrap();
+        let claim = store.provenance_claim().unwrap();
+        let sign1 = parse_cose_sign1(
+            claim.signature_val(),
+            &claim.data().unwrap(),
+            &mut StatusTracker::default(),
+        )
+        .unwrap();
+        let leaf = cert_chain_from_sign1(&sign1).unwrap().remove(0);
+        let allowed_leaf = pem::encode(&pem::Pem::new("CERTIFICATE", leaf));
+
+        for allowed_list in [false, true] {
+            for kind in [
+                TrustListKind::Manifest,
+                TrustListKind::CAWG,
+                TrustListKind::TSA,
+            ] {
+                let uri = format!("urn:test:{kind:?}");
+                let mut settings = Settings::default();
+                settings.verify.verify_trust = true;
+                settings.verify.verify_timestamp_trust = false; // isolate the claim's trust purpose
+                settings.trust.anchors = Some(vec![crate::settings::TrustAnchor {
+                    trust_kind: kind.clone(),
+                    trust_uri: Some(uri.clone()),
+                    trust_anchors: if allowed_list {
+                        String::new()
+                    } else {
+                        roots.to_string()
+                    },
+                    allowed_list: allowed_list.then(|| allowed_leaf.clone()),
+                    trust_config: None,
+                    trusted_ica_issuers: None,
+                }]);
+                let reader =
+                    crate::Reader::from_context(Context::new().with_settings(settings).unwrap())
+                        .with_stream("image/jpeg", Cursor::new(asset))
+                        .unwrap();
+                let expected = if kind == TrustListKind::Manifest {
+                    ValidationState::Trusted
+                } else {
+                    ValidationState::Valid
+                };
+                assert_eq!(
+                    reader.validation_state(),
+                    expected,
+                    "kind={kind:?}, allowed_list={allowed_list}"
+                );
+                let active = reader
+                    .validation_results()
+                    .unwrap()
+                    .active_manifest()
+                    .unwrap();
+                assert!(active
+                    .success()
+                    .iter()
+                    .any(|s| s.code() == validation_status::CLAIM_SIGNATURE_VALIDATED));
+                let trusted = active
+                    .success()
+                    .iter()
+                    .find(|s| s.code() == validation_status::SIGNING_CREDENTIAL_TRUSTED);
+                if kind == TrustListKind::Manifest {
+                    let trusted = trusted.expect("manifest-purpose trust must be reported");
+                    if !allowed_list {
+                        assert_eq!(trusted.trust_list_uri(), Some(uri.as_str()));
+                    }
+                } else {
+                    assert!(trusted.is_none());
+                    assert!(active
+                        .failure()
+                        .iter()
+                        .any(|s| s.code() == validation_status::SIGNING_CREDENTIAL_UNTRUSTED));
+                }
+            }
+        }
     }
 }
