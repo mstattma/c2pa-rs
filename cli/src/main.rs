@@ -337,15 +337,17 @@ enum Commands {
     /// Segments are discovered via `--segments_glob` and processed in natural (numeric-aware)
     /// filename order. Signed files are written to `--output`.
     ///
-    /// Signing the init segment is optional (per §19.2.3). Pass `--init` to sign it too.
+    /// Draft issue-21 profile: fresh manifest-method signing requires `--init`; an explicit
+    /// `--previous-segment` resumes existing media continuity without re-signing the init.
+    /// This profile is a proposal, not a normative C2PA requirement.
     ///
-    /// Example (segments only):
+    /// Example (resume):
     ///
-    ///   c2patool /streams/live -m manifest.json -o output/ --segments_glob "segment_*.m4s"
+    ///   c2patool /streams/live live-video-sign -m manifest.json -o output/ --segments_glob "segment_*.m4s" --previous-segment output/last.m4s
     ///
     /// Example (with init segment):
     ///
-    ///   c2patool /streams/live -m manifest.json -o output/ --segments_glob "segment_*.m4s" --init init.mp4
+    ///   c2patool /streams/live live-video-sign -m manifest.json -o output/ --segments_glob "segment_*.m4s" --init init.mp4
     ///
     /// NOTE: Quote glob patterns to prevent shell expansion.
     /// NOTE: The manifest JSON must include a 'c2pa.livevideo.segment' assertion with 'streamId'.
@@ -365,17 +367,18 @@ enum Commands {
         #[arg(long = "manifest", short = 'm')]
         manifest: PathBuf,
 
-        /// Optional path to an init segment to sign (§19.2.3). Resolved relative to the path
-        /// argument if not absolute.
+        /// Init segment for fresh signing in the draft init-predecessor profile. During resume,
+        /// the original signed init must already exist in the output directory and is not rewritten.
+        /// Resolved relative to the path argument if not absolute.
         #[arg(long = "init")]
         init: Option<PathBuf>,
 
         /// Optional path to the last signed media segment from a previous invocation.
         /// Used to resume the continuity chain across separate process runs.
         ///
-        /// When using --method vsi, providing this flag skips re-signing the init segment.
-        /// The already-signed init must be present in the output directory (written by the
-        /// first invocation). This preserves the same manifestId across all segments.
+        /// Providing this flag skips re-signing the init segment for either method.
+        /// With VSI, or when --init is also supplied for the manifest method, the original
+        /// signed init must be present in the output directory. It is not rewritten.
         #[arg(long = "previous-segment")]
         previous_segment: Option<PathBuf>,
 

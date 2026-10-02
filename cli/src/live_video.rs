@@ -527,7 +527,22 @@ fn detect_validation_method(
 
             (ValidationMethod::VerifiableSegmentInfo, init_state)
         }
-        Err(_) => (ValidationMethod::ManifestBox, init_state),
+        Err(_) => {
+            // Draft issue-21 profile: treat this verified init as the stream's bootstrap.
+            // Midstream joins/reinitialization need explicit semantics before this can merge.
+            match manifest.label() {
+                Some(id) => {
+                    let _ = ctx.validator.register_manifest_box_init(id, ctx.tracker);
+                }
+                None => {
+                    let _ = ctx.validator.fail_init_manifest(
+                        "initialization manifest has no label for the draft predecessor profile",
+                        ctx.tracker,
+                    );
+                }
+            }
+            (ValidationMethod::ManifestBox, init_state)
+        }
     }
 }
 

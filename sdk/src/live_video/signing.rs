@@ -24,11 +24,19 @@ use crate::{
 
 /// Signs a sequence of live video segments using the per-segment C2PA Manifest Box method (§19.3).
 ///
-/// Call [`sign_media_segment`] once per segment; sequence numbers and continuity links are managed
-/// automatically. Optionally call [`sign_init_segment`] to embed a manifest into the init segment.
+/// Call [`sign_init_segment`] before the first [`sign_media_segment`], or explicitly restore an
+/// existing media predecessor with [`resume_from_segment`]. Sequence numbers and continuity links
+/// are managed automatically; a fresh stream's first media segment links to the signed init
+/// manifest's actual label.
+///
+/// **Draft proposal/profile policy:** this init-predecessor requirement tracks
+/// [issue #21](https://github.com/mstattma/c2pa-rs/issues/21), not a normative C2PA requirement.
+/// This profile intentionally requires a signed init or explicit resume; no-init genesis and
+/// late-join behavior remain unresolved in the proposal.
 ///
 /// [`sign_media_segment`]: LiveVideoSigner::sign_media_segment
 /// [`sign_init_segment`]: LiveVideoSigner::sign_init_segment
+/// [`resume_from_segment`]: LiveVideoSigner::resume_from_segment
 ///
 /// <div class="warning">
 ///
@@ -67,7 +75,8 @@ impl LiveVideoSigner {
 
     /// Restores continuity state from a previously signed segment.
     ///
-    /// Reads `previousManifestId` and `sequenceNumber` from the segment's embedded manifest.
+    /// Uses the segment's active manifest label as the predecessor and reads `sequenceNumber`
+    /// from its embedded live video assertion.
     /// Use this when signing one segment per process invocation, pointing to the last signed
     /// segment so the chain is not broken.
     pub fn resume_from_segment(&mut self, segment_data: &[u8], format: &str) -> Result<()> {
@@ -93,11 +102,15 @@ impl LiveVideoSigner {
         Ok(())
     }
 
-    /// Signs an init segment with the base manifest (§19.2.3). Optional for §19.3 streams.
+    /// Signs an init segment with the base manifest (§19.2.3).
     ///
-    /// No `c2pa.livevideo.segment` assertion is added and continuity state is not updated.
+    /// Under the draft profile in [issue #21](https://github.com/mstattma/c2pa-rs/issues/21), its
+    /// actual manifest label establishes continuity only if no predecessor is already known.
+    /// This is proposal policy, not a normative C2PA requirement. No `c2pa.livevideo.segment`
+    /// assertion is added, and the media sequence number is not advanced. Repeated init signing
+    /// preserves any existing init, media, or explicitly resumed predecessor.
     pub fn sign_init_segment(
-        &self,
+        &mut self,
         segment_data: &[u8],
         format: &str,
         signer: &dyn Signer,
@@ -107,16 +120,30 @@ impl LiveVideoSigner {
         let mut source = Cursor::new(segment_data);
         let mut dest = Cursor::new(Vec::new());
         builder.sign(signer, format, &mut source, &mut dest)?;
-        Ok(dest.into_inner())
+        let signed_bytes = dest.into_inner();
+        let manifest_id = extract_signed_manifest_id(&signed_bytes, format)?;
+        if self.previous_manifest_id.is_none() {
+            self.previous_manifest_id = Some(manifest_id);
+        }
+        Ok(signed_bytes)
     }
 
     /// Signs a media segment, embeds a `c2pa.livevideo.segment` assertion, and advances state.
+    ///
+    /// The draft init-predecessor profile rejects signing without a signed init or explicit
+    /// [`resume_from_segment`](Self::resume_from_segment), before invoking the signer.
     pub fn sign_media_segment(
         &mut self,
         segment_data: &[u8],
         format: &str,
         signer: &dyn Signer,
     ) -> Result<Vec<u8>> {
+        if self.previous_manifest_id.is_none() {
+            return Err(Error::BadParam(
+                "a signed init segment or explicit resume_from_segment is required before media signing"
+                    .to_string(),
+            ));
+        }
         let assertion = self.build_live_video_assertion();
 
         let mut builder = Builder::from_context(super::context_from_thread_local_settings()?)
@@ -136,7 +163,8 @@ impl LiveVideoSigner {
         Ok(signed_bytes)
     }
 
-    /// Returns the manifest ID of the most recently signed media segment, if any.
+    /// Returns the known predecessor's manifest ID: the signed init, latest media segment,
+    /// or explicitly resumed media segment, if any.
     pub fn previous_manifest_id(&self) -> Option<&str> {
         self.previous_manifest_id.as_deref()
     }
@@ -304,6 +332,10 @@ mod tests {
         let mut live_signer = LiveVideoSigner::from_manifest_json(manifest).unwrap();
         assert!(live_signer.previous_manifest_id().is_none());
 
+        let signed_init = live_signer
+            .sign_init_segment(init_fixture(), "video/mp4", &signer)
+            .unwrap();
+        let init_id = extract_signed_manifest_id(&signed_init, "video/mp4").unwrap();
         let signed = live_signer
             .sign_media_segment(segment_fixture(), "video/mp4", &signer)
             .unwrap();
@@ -317,12 +349,16 @@ mod tests {
             .find_assertion(LiveVideoSegment::LABEL)
             .unwrap();
 
-        assert_eq!(assertion.previous_manifest_id, None);
+        assert_eq!(
+            assertion.previous_manifest_id.as_deref(),
+            Some(init_id.as_str())
+        );
+        assert_ne!(init_id, "urn:c2pa:SEEDED-BY-USER");
         assert_eq!(assertion.sequence_number, 1);
     }
 
-    /// §19.3.2 chains each segment to the previous one through `previousManifestId`. The first
-    /// segment has none, and every later one must carry the label of the segment before it.
+    /// The proposed profile links first media to the actual init label; subsequent media
+    /// segments carry the preceding media manifest's label.
     #[test]
     fn previous_manifest_id_chains_across_segments() {
         let _guard = TrustVerificationOff::new();
@@ -334,8 +370,12 @@ mod tests {
             "a fresh signer has nothing to chain to"
         );
 
+        let signed_init = live_signer
+            .sign_init_segment(init_fixture(), "video/mp4", &signer)
+            .unwrap();
+        let mut previous_id = extract_signed_manifest_id(&signed_init, "video/mp4").unwrap();
         let mut labels = Vec::new();
-        for _ in 0..3 {
+        for sequence_number in 1..=3 {
             let signed = live_signer
                 .sign_media_segment(segment_fixture(), "video/mp4", &signer)
                 .unwrap();
@@ -344,6 +384,16 @@ mod tests {
             )
             .with_stream("video/mp4", Cursor::new(&signed))
             .unwrap();
+            let assertion: LiveVideoSegment = reader
+                .active_manifest()
+                .unwrap()
+                .find_assertion(LiveVideoSegment::LABEL)
+                .unwrap();
+            assert_eq!(assertion.sequence_number, sequence_number);
+            assert_eq!(
+                assertion.previous_manifest_id.as_deref(),
+                Some(previous_id.as_str())
+            );
             let label = reader
                 .active_manifest()
                 .unwrap()
@@ -354,6 +404,7 @@ mod tests {
             // After signing segment N, the signer points at N: that is what segment N+1 will
             // record as its `previousManifestId`.
             assert_eq!(live_signer.previous_manifest_id(), Some(label.as_str()));
+            previous_id = label.clone();
             labels.push(label);
         }
 
@@ -362,31 +413,97 @@ mod tests {
         assert_eq!(labels.len(), 3, "each segment must get its own manifest id");
     }
 
-    /// §19.2.3 makes signing the init segment optional, and it carries no
-    /// `c2pa.livevideo.segment` assertion: it must not advance the continuity state.
+    /// Init signing establishes the proposed anchor without a live video assertion or a
+    /// media sequence increment; repeated init signing preserves the original anchor.
     #[test]
-    fn sign_init_segment_does_not_advance_the_chain() {
+    fn sign_init_segment_anchors_without_advancing_media_sequence() {
         let _guard = TrustVerificationOff::new();
         let signer = test_signer();
-        let live_signer = LiveVideoSigner::from_manifest_json(test_manifest_json()).unwrap();
+        let mut live_signer = LiveVideoSigner::from_manifest_json(test_manifest_json()).unwrap();
 
         let signed = live_signer
             .sign_init_segment(init_fixture(), "video/mp4", &signer)
             .unwrap();
-
-        assert!(live_signer.previous_manifest_id().is_none());
 
         let reader =
             Reader::from_context(crate::live_video::context_from_thread_local_settings().unwrap())
                 .with_stream("video/mp4", Cursor::new(&signed))
                 .unwrap();
         let manifest = reader.active_manifest().unwrap();
+        let init_id = manifest.label().unwrap().to_string();
+        assert_eq!(live_signer.previous_manifest_id(), Some(init_id.as_str()));
+        assert_eq!(live_signer.next_sequence_number, 1);
         assert!(
             manifest
                 .find_assertion::<LiveVideoSegment>(LiveVideoSegment::LABEL)
                 .is_err(),
             "the init segment carries no live video segment assertion"
         );
+
+        let repeated_init = live_signer
+            .sign_init_segment(init_fixture(), "video/mp4", &signer)
+            .unwrap();
+        assert_ne!(
+            extract_signed_manifest_id(&repeated_init, "video/mp4").unwrap(),
+            init_id
+        );
+        assert_eq!(live_signer.previous_manifest_id(), Some(init_id.as_str()));
+        assert_eq!(live_signer.next_sequence_number, 1);
+    }
+
+    #[test]
+    fn first_media_segment_without_an_anchor_is_rejected() {
+        let _guard = TrustVerificationOff::new();
+        let signer = test_signer();
+        let mut live_signer = LiveVideoSigner::from_manifest_json(test_manifest_json()).unwrap();
+
+        let err = live_signer
+            .sign_media_segment(segment_fixture(), "video/mp4", &signer)
+            .unwrap_err();
+        assert!(matches!(&err, Error::BadParam(_)));
+        let message = err.to_string();
+        assert!(message.contains("signed init segment"));
+        assert!(message.contains("resume_from_segment"));
+        assert!(live_signer.previous_manifest_id().is_none());
+        assert_eq!(live_signer.next_sequence_number, 1);
+    }
+
+    #[test]
+    fn repeated_init_does_not_overwrite_a_media_predecessor() {
+        let _guard = TrustVerificationOff::new();
+        let signer = test_signer();
+        let mut live_signer = LiveVideoSigner::from_manifest_json(test_manifest_json()).unwrap();
+        live_signer
+            .sign_init_segment(init_fixture(), "video/mp4", &signer)
+            .unwrap();
+        let signed = live_signer
+            .sign_media_segment(segment_fixture(), "video/mp4", &signer)
+            .unwrap();
+        let media_id = extract_signed_manifest_id(&signed, "video/mp4").unwrap();
+
+        live_signer
+            .sign_init_segment(init_fixture(), "video/mp4", &signer)
+            .unwrap();
+        assert_eq!(live_signer.previous_manifest_id(), Some(media_id.as_str()));
+        assert_eq!(live_signer.next_sequence_number, 2);
+
+        let next_signed = live_signer
+            .sign_media_segment(segment_fixture(), "video/mp4", &signer)
+            .unwrap();
+        let reader =
+            Reader::from_context(crate::live_video::context_from_thread_local_settings().unwrap())
+                .with_stream("video/mp4", Cursor::new(&next_signed))
+                .unwrap();
+        let assertion: LiveVideoSegment = reader
+            .active_manifest()
+            .unwrap()
+            .find_assertion(LiveVideoSegment::LABEL)
+            .unwrap();
+        assert_eq!(
+            assertion.previous_manifest_id.as_deref(),
+            Some(media_id.as_str())
+        );
+        assert_eq!(assertion.sequence_number, 2);
     }
 
     /// Signing one segment per process invocation is the live case, so a fresh signer must be
@@ -397,6 +514,9 @@ mod tests {
         let signer = test_signer();
 
         let mut first_run = LiveVideoSigner::from_manifest_json(test_manifest_json()).unwrap();
+        first_run
+            .sign_init_segment(init_fixture(), "video/mp4", &signer)
+            .unwrap();
         let signed = first_run
             .sign_media_segment(segment_fixture(), "video/mp4", &signer)
             .unwrap();
@@ -408,6 +528,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(second_run.previous_manifest_id(), Some(expected.as_str()));
+        assert_eq!(second_run.next_sequence_number, 2);
+
+        second_run
+            .sign_init_segment(init_fixture(), "video/mp4", &signer)
+            .unwrap();
+        assert_eq!(second_run.previous_manifest_id(), Some(expected.as_str()));
+        assert_eq!(second_run.next_sequence_number, 2);
+
+        let next_signed = second_run
+            .sign_media_segment(segment_fixture(), "video/mp4", &signer)
+            .unwrap();
+        let reader =
+            Reader::from_context(crate::live_video::context_from_thread_local_settings().unwrap())
+                .with_stream("video/mp4", Cursor::new(&next_signed))
+                .unwrap();
+        let assertion: LiveVideoSegment = reader
+            .active_manifest()
+            .unwrap()
+            .find_assertion(LiveVideoSegment::LABEL)
+            .unwrap();
+        assert_eq!(
+            assertion.previous_manifest_id.as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(assertion.sequence_number, 2);
     }
 
     #[test]
@@ -426,14 +571,16 @@ mod tests {
     /// different, unrelated identifiers.
     #[test]
     fn sign_media_segment_manifest_id_is_c2pa_urn_label() {
-        // EphemeralSigner certs are intentionally untrusted (see ephemeral_signer.rs).
-        crate::settings::set_settings_value("verify.verify_trust", false).unwrap();
+        let _guard = TrustVerificationOff::new();
 
         let signer = test_signer();
         let segment_data =
             include_bytes!("../../tests/fixtures/bunny/bunny_791182bps/BigBuckBunny_2s5.m4s");
 
         let mut live_signer = LiveVideoSigner::from_manifest_json(test_manifest_json()).unwrap();
+        live_signer
+            .sign_init_segment(init_fixture(), "video/mp4", &signer)
+            .unwrap();
         let signed = live_signer
             .sign_media_segment(segment_data, "video/mp4", &signer)
             .unwrap();

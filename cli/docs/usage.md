@@ -413,12 +413,29 @@ Live video streams a fragmented MP4 (fMP4) asset segment by segment rather than 
 Two signing methods are supported, per §19.3 (per-segment C2PA Manifest Box, the default) and §19.4 (Verifiable Segment Info, which needs an Ed25519 session key):
 
 ```
-c2patool <SEGMENTS_DIR> live-video-sign --segments_glob <GLOB> -o <OUTPUT_DIR> -m <MANIFEST_FILE> [--init <INIT_FILE>]
+c2patool <SEGMENTS_DIR> live-video-sign --segments_glob <GLOB> -o <OUTPUT_DIR> -m <MANIFEST_FILE> --init <INIT_FILE>
 
 c2patool <SEGMENTS_DIR> live-video-sign --segments_glob <GLOB> -o <OUTPUT_DIR> -m <MANIFEST_FILE> --method vsi --session-key <KEY_FILE> --init <INIT_FILE>
 ```
 
 The manifest definition passed to `-m` must include a `c2pa.livevideo.segment` assertion with a `streamId`; see [Manifest definition](manifest.md).
+
+The manifest method on this branch uses the **draft init-rooted profile** tracked
+in [mstattma/c2pa-rs#21](https://github.com/mstattma/c2pa-rs/issues/21), not an
+approved specification interpretation. Fresh signing requires a signed init
+anchor. Use `--previous-segment` to resume an existing media chain instead.
+Resume never re-signs the init: if `--init` is also supplied, its original signed
+output must already be present. Fresh signing refuses to overwrite an existing
+signed init. Keep the original signed init bytes for validation of the whole
+chain; late joins and reinitialization remain unresolved in this proposal.
+
+This draft can reject previously signed baseline streams that carry a signed
+init but omit the first media segment's predecessor field. It is not a backward-
+compatibility promise. Init-only CLI output also has no cross-process continuation
+without a signed media predecessor: stage init and first media together, or keep
+the SDK signer alive. Do not delete/re-sign an already published init to work
+around that limitation; see the [proposal roadmap](../../docs/roadmap/live-video-init-predecessor.md)
+for the pending restore policy.
 
 To validate a previously signed stream, pass the init segment and the same glob pattern used to sign it. The validation method (§19.3 or §19.4) is detected automatically from the init segment's manifest:
 
@@ -504,8 +521,8 @@ The `trust` subcommand's `--trust_anchors`, `--allowed_list` and `--trust_config
 | CLI option | Argument | Description |
 |-----|----|----|
 | `--segments_glob` | `<glob>` | Required with both `live-video` and `live-video-sign`. Glob pattern to find the media segments, resolved relative to the init segment's (or, for `live-video-sign`, the path argument's) directory, and matched in natural (numeric-aware) filename order. |
-| `--init` | `<init_file>` | With `live-video-sign` (§19.3), optionally also signs the init segment. With `--method vsi`, the init segment is required (§19.4 mandates a signed manifest there). |
-| `--previous-segment` | `<segment_file>` | Resumes the continuity chain from a prior `live-video-sign` invocation's last signed segment, for a process that restarts mid-stream. With `--method vsi`, this also skips re-signing the init segment. |
+| `--init` | `<init_file>` | Required for fresh manifest-method signing under the draft issue-21 profile; this is not claimed as a universal spec rule. With `--method vsi`, the init segment is required. During resume, the original signed init is retained, not re-signed. |
+| `--previous-segment` | `<segment_file>` | Resumes the continuity chain from a prior invocation's last signed media segment. Both methods skip re-signing init; if init is supplied, its original signed output must already be available. |
 | `--method` | `manifest` &#124; `vsi` | Signing method for `live-video-sign` (default `manifest`). |
 | `--session-key` | `<key_file>` | Required with `--method vsi`: an Ed25519 session key, as a 32-byte raw seed file. Reused across all invocations for the same live video session. |
 | `--min-sequence-number` | `<n>` | With `--method vsi`, the VSI session key's starting `minSequenceNumber`. Only used on the first invocation (no `--previous-segment`); if omitted, it's inferred from the first media segment's own `moof/mfhd.sequence_number`. |
@@ -518,4 +535,3 @@ You can run the Wasm binary created for `wasm32-wasip2` directly with [wasmtime]
 ```
 wasmtime -S cli -S http --dir . c2patool.wasm [OPTIONS] <ASSET_PATH> [COMMAND]
 ```
-

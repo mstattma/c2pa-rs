@@ -29,8 +29,8 @@ use c2pa::{
 /// in natural (numeric-aware) filename order. Signed files are written to `output_dir` preserving
 /// file names.
 ///
-/// If `init_path` is provided, the init segment is also signed and written to `output_dir`.
-/// Per §19.2.3, signing the init segment is optional.
+/// Draft issue-21 profile: a fresh run requires `init_path`; an explicit media resume preserves
+/// the original signed init rather than re-signing it. This is proposal policy, not a spec rule.
 pub fn sign_live_video(
     segments_dir: &Path,
     segments_glob: &Path,
@@ -40,6 +40,12 @@ pub fn sign_live_video(
     output_dir: &Path,
     signer: &dyn Signer,
 ) -> Result<()> {
+    if init_path.is_none() && previous_segment_path.is_none() {
+        bail!(
+            "The draft init-predecessor profile requires --init for fresh signing or \
+             --previous-segment for an explicit resume"
+        );
+    }
     fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output directory: {output_dir:?}"))?;
 
@@ -56,7 +62,23 @@ pub fn sign_live_video(
     }
 
     if let Some(init) = init_path {
-        sign_init_segment(init, output_dir, &live_signer, signer)?;
+        let signed_init_path = output_path_for(init, output_dir)?;
+        if previous_segment_path.is_some() {
+            if !signed_init_path.is_file() {
+                bail!(
+                    "Resume with --init requires the original signed init at {signed_init_path:?}; \
+                     refusing to replace the bootstrap with a new manifest"
+                );
+            }
+        } else {
+            if signed_init_path.exists() {
+                bail!(
+                    "Init output path already exists at {signed_init_path:?}; use an empty \
+                     output directory for a new stream or --previous-segment to resume"
+                );
+            }
+            sign_init_segment(init, output_dir, &mut live_signer, signer)?;
+        }
     }
 
     let segment_paths = crate::live_video_common::collect_segments(segments_dir, segments_glob)?;
@@ -99,7 +121,7 @@ pub fn sign_live_video(
 fn sign_init_segment(
     init_path: &Path,
     output_dir: &Path,
-    live_signer: &LiveVideoSigner,
+    live_signer: &mut LiveVideoSigner,
     signer: &dyn Signer,
 ) -> Result<()> {
     let init_data = fs::read(init_path)
@@ -529,6 +551,188 @@ mod tests {
         }
 
         ((dir, trust_guard), segments_dir, output_dir, init_path)
+    }
+
+    #[test]
+    fn manifest_profile_requires_init_or_explicit_resume_before_creating_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let signer = test_signer();
+        let error = sign_live_video(
+            dir.path(),
+            Path::new("*.m4s"),
+            None,
+            None,
+            "{}",
+            &output,
+            signer.as_ref(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires --init"));
+        assert!(error.to_string().contains("--previous-segment"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn manifest_init_only_continuation_is_explicitly_unsupported_in_this_draft() {
+        let (_guard, input, output, init) = setup_vsi_dirs(0);
+        let signer = test_signer();
+        let manifest = r#"{"assertions":[
+            {"label":"c2pa.actions","data":{"actions":[{"action":"c2pa.created","digitalSourceType":"http://c2pa.org/digitalsourcetype/empty"}]}},
+            {"label":"c2pa.livevideo.segment","data":{"streamId":"init-only","continuityMethod":"c2pa.manifestId","sequenceNumber":1}}
+        ]}"#;
+        sign_live_video(
+            &input,
+            Path::new("seg_*.m4s"),
+            Some(&init),
+            None,
+            manifest,
+            &output,
+            signer.as_ref(),
+        )
+        .unwrap();
+        let signed_init_path = output.join("init.mp4");
+        let original_init = fs::read(&signed_init_path).unwrap();
+        write_media_segment(&input, "seg_001.m4s");
+        let error = sign_live_video(
+            &input,
+            Path::new("seg_*.m4s"),
+            Some(&init),
+            None,
+            manifest,
+            &output,
+            signer.as_ref(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Init output path already exists"));
+        let error = sign_live_video(
+            &input,
+            Path::new("seg_*.m4s"),
+            Some(&init),
+            Some(&signed_init_path),
+            manifest,
+            &output,
+            signer.as_ref(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("c2pa.livevideo.segment"));
+        assert_eq!(fs::read(signed_init_path).unwrap(), original_init);
+        assert!(!output.join("seg_001.m4s").exists());
+    }
+
+    #[test]
+    fn manifest_resume_preserves_bootstrap_init_and_validates_the_whole_chain() {
+        let _guard = TrustVerificationOff::new();
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in");
+        let output = dir.path().join("out");
+        fs::create_dir(&input).unwrap();
+        let init = input.join("init.mp4");
+        fs::write(&init, INIT_FIXTURE).unwrap();
+        // Manifest insertion needs a segment-type header; VSI's bare-mdat helper does not.
+        let media = [
+            make_box(b"styp", b"msdh\0\0\0\0msdhmsix"),
+            make_box(b"mdat", &[0u8; 16]),
+        ]
+        .concat();
+        fs::write(input.join("seg_001.m4s"), &media).unwrap();
+        fs::write(input.join("seg_002.m4s"), &media).unwrap();
+        let signer = test_signer();
+        let manifest = r#"{"assertions":[
+            {"label":"c2pa.actions","data":{"actions":[{"action":"c2pa.created","digitalSourceType":"http://c2pa.org/digitalsourcetype/empty"}]}},
+            {"label":"c2pa.livevideo.segment","data":{"streamId":"bootstrap-test","continuityMethod":"c2pa.manifestId","sequenceNumber":1}}
+        ]}"#;
+        sign_live_video(
+            &input,
+            Path::new("seg_001.m4s"),
+            Some(&init),
+            None,
+            manifest,
+            &output,
+            signer.as_ref(),
+        )
+        .unwrap();
+        let original_init = fs::read(output.join("init.mp4")).unwrap();
+        let error = sign_live_video(
+            &input,
+            Path::new("seg_002.m4s"),
+            Some(&init),
+            None,
+            manifest,
+            &output,
+            signer.as_ref(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Init output path already exists"));
+        assert_eq!(fs::read(output.join("init.mp4")).unwrap(), original_init);
+
+        let previous = output.join("seg_001.m4s");
+        let missing_output = dir.path().join("missing-original-init");
+        let error = sign_live_video(
+            &input,
+            Path::new("seg_002.m4s"),
+            Some(&init),
+            Some(&previous),
+            manifest,
+            &missing_output,
+            signer.as_ref(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires the original signed init"));
+
+        sign_live_video(
+            &input,
+            Path::new("seg_002.m4s"),
+            Some(&init),
+            Some(&previous),
+            manifest,
+            &output,
+            signer.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(output.join("init.mp4")).unwrap(), original_init);
+        let context = std::sync::Arc::new(c2pa::Context::new());
+        crate::live_video::validate_live_video(
+            &context,
+            &output.join("init.mp4"),
+            Path::new("seg_*.m4s"),
+        )
+        .unwrap();
+
+        // Authenticated media rooted in a different init must fail the CLI's first-link check.
+        let other_output = dir.path().join("other-bootstrap");
+        sign_live_video(
+            &input,
+            Path::new("seg_001.m4s"),
+            Some(&init),
+            None,
+            manifest,
+            &other_output,
+            signer.as_ref(),
+        )
+        .unwrap();
+        let other_media = fs::read(other_output.join("seg_001.m4s")).unwrap();
+        let reader = c2pa::Reader::from_shared_context(&context)
+            .with_stream("video/mp4", std::io::Cursor::new(&other_media))
+            .unwrap();
+        assert_ne!(reader.validation_state(), c2pa::ValidationState::Invalid);
+        fs::write(output.join("other_001.m4s"), other_media).unwrap();
+        let error = crate::live_video::validate_live_video(
+            &context,
+            &output.join("init.mp4"),
+            Path::new("other_*.m4s"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Live video validation failed: 1/1 segment(s) failed, 1 continuity error(s)"
+        );
     }
 
     #[test]
