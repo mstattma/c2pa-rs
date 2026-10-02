@@ -26,7 +26,7 @@ use crate::{
     error::{Error, Result},
     status_tracker::StatusTracker,
     validation_results::validation_codes::{
-        LIVEVIDEO_ASSERTION_INVALID, LIVEVIDEO_SEGMENT_INVALID, LIVEVIDEO_SESSIONKEY_INVALID,
+        LIVEVIDEO_SEGMENT_INVALID, LIVEVIDEO_SESSIONKEY_INVALID,
     },
 };
 
@@ -184,7 +184,7 @@ impl LiveVideoValidator {
             if seq_num <= previous.sequence_number {
                 return fail_validation(
                     "VSI sequenceNumber must be strictly greater than the previous segment's",
-                    LIVEVIDEO_ASSERTION_INVALID,
+                    LIVEVIDEO_SEGMENT_INVALID,
                     tracker,
                 );
             }
@@ -834,26 +834,88 @@ mod tests {
     }
 
     #[test]
-    fn vsi_regressed_sequence_number_fails() {
+    fn vsi_equal_sequence_number_fails() {
         use vsi_crypto_helpers::*;
-
-        use crate::validation_results::validation_codes::LIVEVIDEO_ASSERTION_INVALID;
         let (mut validator, signing_key) = setup_vsi_validator();
         let mut tracker = StatusTracker::default();
 
-        let _ = validator.validate_verifiable_segment_info(
-            &make_signed_vsi_segment(5, TEST_MANIFEST_ID, &signing_key),
-            &mut tracker,
-        );
-        let _ = validator.validate_verifiable_segment_info(
-            &make_signed_vsi_segment(4, TEST_MANIFEST_ID, &signing_key),
-            &mut tracker,
-        );
+        let segment = make_signed_vsi_segment(5, TEST_MANIFEST_ID, &signing_key);
+        validator
+            .validate_verifiable_segment_info(&segment, &mut tracker)
+            .unwrap();
+        assert_eq!(tracker.filter_errors().count(), 0);
 
-        assert!(tracker
-            .logged_items()
-            .iter()
-            .any(|i| { i.validation_status.as_deref() == Some(LIVEVIDEO_ASSERTION_INVALID) }));
+        validator
+            .validate_verifiable_segment_info(&segment, &mut tracker)
+            .unwrap();
+
+        assert_eq!(
+            tracker
+                .filter_errors()
+                .map(|i| i.validation_status.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some(LIVEVIDEO_SEGMENT_INVALID)]
+        );
+        assert_eq!(
+            validator.previous_segment.as_ref().unwrap().sequence_number,
+            5
+        );
+    }
+
+    #[test]
+    fn vsi_regressed_sequence_number_fails() {
+        use vsi_crypto_helpers::*;
+        let (mut validator, signing_key) = setup_vsi_validator();
+        let mut tracker = StatusTracker::default();
+
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(5, TEST_MANIFEST_ID, &signing_key),
+                &mut tracker,
+            )
+            .unwrap();
+        assert_eq!(tracker.filter_errors().count(), 0);
+
+        validator
+            .validate_verifiable_segment_info(
+                &make_signed_vsi_segment(4, TEST_MANIFEST_ID, &signing_key),
+                &mut tracker,
+            )
+            .unwrap();
+
+        assert_eq!(
+            tracker
+                .filter_errors()
+                .map(|i| i.validation_status.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some(LIVEVIDEO_SEGMENT_INVALID)]
+        );
+        assert_eq!(
+            validator.previous_segment.as_ref().unwrap().sequence_number,
+            5
+        );
+    }
+
+    #[test]
+    fn vsi_nonconsecutive_sequence_numbers_advance_state() {
+        use vsi_crypto_helpers::*;
+        let (mut validator, signing_key) = setup_vsi_validator();
+        let mut tracker = StatusTracker::default();
+
+        for sequence_number in [1, 5, 6] {
+            validator
+                .validate_verifiable_segment_info(
+                    &make_signed_vsi_segment(sequence_number, TEST_MANIFEST_ID, &signing_key),
+                    &mut tracker,
+                )
+                .unwrap();
+
+            assert_eq!(tracker.filter_errors().count(), 0);
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().sequence_number,
+                sequence_number
+            );
+        }
     }
 
     #[test]
