@@ -67,13 +67,13 @@ pub use vsi_signing::{moof_sequence_number, LiveVideoVsiSigner};
 
 use self::cose_key::kid_from_cose_key;
 use crate::{
-    assertions::{LiveVideoSegment, SessionKey, SessionKeys},
+    assertions::{ContinuityMethod, LiveVideoSegment, SessionKey, SessionKeys},
     error::{Error, Result},
     log_item,
     status_tracker::StatusTracker,
     validation_results::validation_codes::{
-        LIVEVIDEO_INIT_INVALID, LIVEVIDEO_MANIFEST_INVALID, LIVEVIDEO_SEGMENT_INVALID,
-        LIVEVIDEO_SESSIONKEY_INVALID,
+        LIVEVIDEO_CONTINUITY_METHOD_INVALID, LIVEVIDEO_INIT_INVALID, LIVEVIDEO_MANIFEST_INVALID,
+        LIVEVIDEO_SEGMENT_INVALID, LIVEVIDEO_SESSIONKEY_INVALID,
     },
 };
 
@@ -130,6 +130,7 @@ struct SegmentState {
 /// </div>
 pub struct LiveVideoValidator {
     previous_segment: Option<SegmentState>,
+    manifest_box_init_id: Option<String>,
     session_keys: Vec<SessionKey>,
     /// The manifest identifier (c2pa URN label) of the trusted manifest that carried the
     /// `c2pa.session-keys` assertion, captured by [`validate_session_keys`]. Every VSI
@@ -143,6 +144,7 @@ impl LiveVideoValidator {
     pub fn new() -> Self {
         Self {
             previous_segment: None,
+            manifest_box_init_id: None,
             session_keys: Vec::new(),
             expected_manifest_id: None,
         }
@@ -213,7 +215,40 @@ impl LiveVideoValidator {
         fail_validation(description, LIVEVIDEO_MANIFEST_INVALID, tracker)
     }
 
+    /// Registers a verified init manifest as the first media predecessor for the draft profile.
+    ///
+    /// The caller must first validate the init manifest and its hard binding under its trust
+    /// policy. This does not perform cryptographic validation or reset an existing media chain.
+    /// Only register an init known to be the stream's bootstrap, not an arbitrary active init
+    /// obtained by a late joiner. This is proposal policy tracked in
+    /// [issue #21](https://github.com/mstattma/c2pa-rs/issues/21), not a normative C2PA rule.
+    /// Registration replaces an unused bootstrap anchor; an already accepted media predecessor
+    /// still takes priority. The caller must decide whether replacing an unused anchor is valid.
+    /// Rejection logs a tracker failure without installing the new anchor. Under
+    /// `ContinueWhenPossible` it can still return `Ok(())`, so inspect the tracker as well.
+    pub fn register_manifest_box_init(
+        &mut self,
+        manifest_id: &str,
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        if crate::jumbf::labels::manifest_label_from_uri(manifest_id).is_some()
+            || crate::jumbf::labels::manifest_label_to_parts(manifest_id)
+                .is_none_or(|parts| parts.guid.is_empty())
+        {
+            return self.fail_init_manifest(
+                "initialization manifest must have a bare, non-empty C2PA manifest label",
+                tracker,
+            );
+        }
+        self.manifest_box_init_id = Some(manifest_id.to_string());
+        Ok(())
+    }
+
     /// Validates a media segment using the per-segment C2PA Manifest Box method ([§19.3]).
+    ///
+    /// The draft init-rooted profile compares first media against a previously registered init.
+    /// Unregistered/unknown predecessors retain the baseline behavior pending issue #21;
+    /// no genesis placeholder or unconditional field-presence rule is introduced here.
     ///
     /// [§19.3]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#using_c2pa_manifest_box
     pub fn validate_media_segment(
@@ -232,6 +267,26 @@ impl LiveVideoValidator {
 
         self.validate_segment_has_c2pa_or_emsg(segment_data, tracker)?;
         self.validate_continuity_rules(assertion, tracker)?;
+
+        if self.previous_segment.is_none()
+            && matches!(assertion.continuity_method, ContinuityMethod::ManifestId)
+        {
+            if let Some(expected) = &self.manifest_box_init_id {
+                match assertion.previous_manifest_id.as_deref() {
+                    Some(actual) if actual == expected => {}
+                    Some(_) => fail_validation(
+                        "first media previousManifestId does not match the registered init manifest",
+                        LIVEVIDEO_SEGMENT_INVALID,
+                        tracker,
+                    )?,
+                    None => fail_validation(
+                        "previousManifestId is required for the registered init predecessor",
+                        LIVEVIDEO_CONTINUITY_METHOD_INVALID,
+                        tracker,
+                    )?,
+                }
+            }
+        }
 
         if let Some(previous) = &self.previous_segment {
             self.validate_sequence_number(assertion, previous, tracker)?;

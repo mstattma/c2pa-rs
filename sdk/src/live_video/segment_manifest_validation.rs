@@ -237,6 +237,141 @@ mod tests {
     }
 
     #[test]
+    fn registered_init_anchors_first_media_then_preserves_media_chain() {
+        let mut validator = LiveVideoValidator::new();
+        let segment_data = make_uuid_box(true);
+        let mut tracker = StatusTracker::default();
+        validator
+            .register_manifest_box_init("urn:c2pa:init", &mut tracker)
+            .unwrap();
+        let mut first = make_segment(1, "stream-1");
+        first.previous_manifest_id = Some("urn:c2pa:init".to_string());
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:media-1", &first, &mut tracker)
+            .unwrap();
+        assert!(!tracker.has_any_error());
+
+        // Registration is not an implicit reset of the observed media predecessor.
+        validator
+            .register_manifest_box_init("urn:c2pa:another-init", &mut tracker)
+            .unwrap();
+        let mut second = make_segment(2, "stream-1");
+        second.previous_manifest_id = Some("urn:c2pa:media-1".to_string());
+        validator
+            .validate_media_segment(&segment_data, "urn:c2pa:media-2", &second, &mut tracker)
+            .unwrap();
+        assert!(!tracker.has_any_error());
+    }
+
+    #[test]
+    fn registered_init_rejects_wrong_or_missing_first_link_without_advancing() {
+        for (predecessor, code) in [
+            (Some("urn:c2pa:wrong"), LIVEVIDEO_SEGMENT_INVALID),
+            (None, LIVEVIDEO_CONTINUITY_METHOD_INVALID),
+        ] {
+            let mut validator = LiveVideoValidator::new();
+            let segment_data = make_uuid_box(true);
+            let mut tracker = StatusTracker::default();
+            validator
+                .register_manifest_box_init("urn:c2pa:init", &mut tracker)
+                .unwrap();
+            let mut first = make_segment(1, "stream-1");
+            first.previous_manifest_id = predecessor.map(str::to_string);
+            validator
+                .validate_media_segment(&segment_data, "urn:c2pa:bad-media", &first, &mut tracker)
+                .unwrap();
+            assert!(tracker.has_status(code));
+            assert_eq!(tracker.filter_errors().count(), 1);
+            assert!(validator.previous_segment.is_none());
+
+            first.previous_manifest_id = Some("urn:c2pa:init".to_string());
+            validator
+                .validate_media_segment(&segment_data, "urn:c2pa:media-1", &first, &mut tracker)
+                .unwrap();
+            assert_eq!(tracker.filter_errors().count(), 1);
+            assert_eq!(
+                validator.previous_segment.as_ref().unwrap().manifest_id,
+                "urn:c2pa:media-1"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_predecessor_behavior_is_unchanged_pending_bootstrap_discussion() {
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = StatusTracker::default();
+        let mut first = make_segment(1, "stream-1");
+        first.previous_manifest_id = None;
+        validator
+            .validate_media_segment(
+                &make_uuid_box(true),
+                "urn:c2pa:media-1",
+                &first,
+                &mut tracker,
+            )
+            .unwrap();
+        assert!(!tracker.has_any_error());
+        assert!(validator.previous_segment.is_some());
+    }
+
+    #[test]
+    fn registered_init_does_not_hide_cascading_failure_before_first_acceptance() {
+        let mut validator = LiveVideoValidator::new();
+        let segment_data = make_uuid_box(true);
+        let mut tracker = StatusTracker::default();
+        validator
+            .register_manifest_box_init("urn:c2pa:init", &mut tracker)
+            .unwrap();
+        for (sequence, predecessor) in [(1, "urn:c2pa:wrong"), (2, "urn:c2pa:media-1")] {
+            let mut segment = make_segment(sequence, "stream-1");
+            segment.previous_manifest_id = Some(predecessor.to_string());
+            validator
+                .validate_media_segment(&segment_data, "urn:c2pa:media", &segment, &mut tracker)
+                .unwrap();
+            assert!(validator.previous_segment.is_none());
+        }
+        assert_eq!(tracker.filter_errors().count(), 2);
+        assert!(tracker
+            .filter_errors()
+            .all(|item| item.validation_status.as_deref() == Some(LIVEVIDEO_SEGMENT_INVALID)));
+    }
+
+    #[test]
+    fn init_predecessor_registration_accepts_legacy_manifest_urns() {
+        for id in [
+            "urn:uuid:43e0d283-f8c3-4d80-9f93-08e548b6c99b",
+            "acme:urn:uuid:43e0d283-f8c3-4d80-9f93-08e548b6c99b",
+        ] {
+            let mut validator = LiveVideoValidator::new();
+            let mut tracker = StatusTracker::default();
+            validator
+                .register_manifest_box_init(id, &mut tracker)
+                .unwrap();
+            assert!(!tracker.has_any_error());
+            assert_eq!(validator.manifest_box_init_id.as_deref(), Some(id));
+        }
+    }
+
+    #[test]
+    fn init_predecessor_registration_rejects_non_manifest_identifiers() {
+        for id in [
+            "",
+            "urn:c2pa:",
+            "urn:uuid:",
+            "https://example.test/init",
+            "self#jumbf=/c2pa/urn:c2pa:init",
+        ] {
+            let mut validator = LiveVideoValidator::new();
+            let mut tracker = StatusTracker::default();
+            validator
+                .register_manifest_box_init(id, &mut tracker)
+                .unwrap();
+            assert!(tracker.has_status(LIVEVIDEO_MANIFEST_INVALID));
+            assert!(validator.manifest_box_init_id.is_none());
+        }
+    }
+
+    #[test]
     fn valid_sequence_advances_state() {
         let mut validator = LiveVideoValidator::new();
         let segment_data = make_uuid_box(true);
