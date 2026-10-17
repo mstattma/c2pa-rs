@@ -1239,10 +1239,11 @@ pub unsafe extern "C" fn c2pa_reader_with_fragment(
 /// With the default exclusions, `stream` must hold every byte before the first
 /// C2PA `merkle` uuid box, and `fragment` must start at a `merkle` uuid box and
 /// end right before the next one (or at the end of the file). A `sidx` that
-/// sits before the next `moof` belongs to the earlier fragment. Any other cut,
-/// or the right cut at the wrong offset, is reported as
-/// `assertion.bmffHash.mismatch` in the returned reader's validation results,
-/// not as NULL. The offset is supplied by the caller: it proves the bytes
+/// sits before the next `moof` belongs to the earlier fragment. With a valid
+/// init and a parseable fragment, hash failures caused by a wrong cut or offset
+/// are reported as `assertion.bmffHash.mismatch` in the returned reader's
+/// validation results, not as NULL. Init-loading or fragment-parsing errors
+/// return NULL. The offset is supplied by the caller: it proves the bytes
 /// belong to the Merkle leaf they name, not where the caller fetched them.
 ///
 /// Settings and trust come from `reader`; create it with
