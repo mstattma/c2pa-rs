@@ -408,7 +408,7 @@ impl LiveVideoValidator {
             Some(b) if !b.is_empty() => b,
             _ => {
                 return reject_signer_binding(
-                    "session key signerBinding must be a non-empty COSE_Sign1_Tagged byte string",
+                    "session key signerBinding must be a detached four-element COSE_Sign1 array",
                     tracker,
                 );
             }
@@ -498,13 +498,50 @@ fn extract_iat(sign1: &coset::CoseSign1) -> Option<i64> {
 /// Extracts the tag-18 COSE_Sign1_Tagged bytes from a session key's `signerBinding`, ready for
 /// `coset::CoseSign1::from_tagged_slice`.
 ///
-/// Per §18.25 the `signerBinding` is a native CBOR tag-18 value, so re-encoding it yields the
-/// tagged COSE_Sign1 bytes directly.
+/// Per §18.25 the binding is a native tag-18 array. The Reader's CBOR-to-JSON path drops
+/// that tag and turns byte strings into integer arrays. Normalize only the two byte fields;
+/// keep protected-header bytes exact and leave unprotected-map labels and values unchanged
+/// (current bindings have an empty unprotected map). No integer-key coercion is performed.
 fn extract_signer_binding_bytes(value: &c2pa_cbor::Value) -> Option<Vec<u8>> {
-    match value {
-        c2pa_cbor::Value::Tag(18, _) => c2pa_cbor::to_vec(value).ok(),
-        _ => None,
+    use c2pa_cbor::Value;
+
+    let value = match value {
+        Value::Tag(18, inner) => inner.as_ref(),
+        other => other,
+    };
+    let Value::Array(items) = value else {
+        return None;
+    };
+    let [protected, unprotected, Value::Null, signature] = items.as_slice() else {
+        return None;
+    };
+    if !matches!(unprotected, Value::Map(_)) {
+        return None;
     }
+
+    let bytes = |value: &Value| -> Option<Vec<u8>> {
+        match value {
+            Value::Bytes(bytes) => Some(bytes.clone()),
+            Value::Array(items) => items
+                .iter()
+                .map(|item| match item {
+                    Value::Integer(n) => u8::try_from(*n).ok(),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        }
+    };
+    c2pa_cbor::to_vec(&Value::Tag(
+        18,
+        Box::new(Value::Array(vec![
+            Value::Bytes(bytes(protected)?),
+            unprotected.clone(),
+            Value::Null,
+            Value::Bytes(bytes(signature)?),
+        ])),
+    ))
+    .ok()
 }
 
 #[cfg(test)]
@@ -1070,6 +1107,43 @@ mod tests {
     }
 
     #[test]
+    fn signer_binding_valid_after_reader_json_round_trip() {
+        use vsi_crypto_helpers::*;
+
+        use crate::assertion::AssertionBase;
+
+        let (signing_key, cose_key) = generate_test_key_pair();
+        let ee_cert_der = test_ee_cert_der();
+        let keys = session_keys_with_cose_key(cose_key, &signing_key, &ee_cert_der);
+
+        // Mirror the Reader's CBOR -> JSON -> typed assertion path, not a hand-built shape.
+        let json = keys.to_assertion().unwrap().as_json_object().unwrap();
+        let restored: SessionKeys = serde_json::from_value(json).unwrap();
+        let c2pa_cbor::Value::Array(items) = &restored.keys[0].signer_binding else {
+            panic!("Reader round-trip must drop the outer tag");
+        };
+        assert!(matches!(&items[0], c2pa_cbor::Value::Array(_)));
+        assert!(matches!(&items[3], c2pa_cbor::Value::Array(_)));
+        assert_eq!(
+            super::extract_signer_binding_bytes(&restored.keys[0].signer_binding),
+            super::extract_signer_binding_bytes(&keys.keys[0].signer_binding)
+        );
+
+        let mut validator = LiveVideoValidator::new();
+        let mut tracker = StatusTracker::default();
+        validator
+            .validate_session_keys(&restored, TEST_MANIFEST_ID, Some(&ee_cert_der), &mut tracker)
+            .unwrap();
+        assert_eq!(validator.session_keys.len(), 1);
+        assert!(!tracker.logged_items().iter().any(|i| {
+            i.validation_status
+                .as_deref()
+                .map(|s| s.starts_with("livevideo"))
+                .unwrap_or(false)
+        }));
+    }
+
+    #[test]
     fn signer_binding_bad_signature_fails() {
         let signer =
             crate::utils::ephemeral_signer::EphemeralSigner::new("test-binding.local").unwrap();
@@ -1252,8 +1326,7 @@ mod tests {
 
     // ── extract_signer_binding_bytes ─────────────────────────────────────────────
     //
-    // Per §18.25 `signerBinding` is a native tagged CBOR value (`18([...])`); re-encoding it
-    // yields the COSE_Sign1_Tagged bytes that `coset::CoseSign1::from_tagged_slice` expects.
+    // Native tagged bindings and Reader-shaped arrays both yield exactly one tag 18.
 
     #[test]
     fn extract_signer_binding_bytes_from_native_tag18() {
@@ -1282,7 +1355,99 @@ mod tests {
     }
 
     #[test]
-    fn extract_signer_binding_bytes_returns_none_for_untagged_shape() {
+    fn extract_signer_binding_bytes_normalizes_only_byte_fields() {
+        use c2pa_cbor::Value;
+
+        // Valid EdDSA header with non-minimal integer encodings: never reserialize its map.
+        let protected = vec![0xa1, 0x18, 0x01, 0x38, 0x07];
+        let signature = vec![0, 0xff];
+        let byte_field = |bytes: &[u8], as_array: bool| {
+            if as_array {
+                Value::Array(bytes.iter().map(|b| cbor_int(i64::from(*b))).collect())
+            } else {
+                Value::Bytes(bytes.to_vec())
+            }
+        };
+        let mut unprotected = std::collections::BTreeMap::new();
+        unprotected.insert(cbor_int(4), Value::Bytes(b"kid".to_vec()));
+        let expected = Value::Tag(
+            18,
+            Box::new(Value::Array(vec![
+                Value::Bytes(protected.clone()),
+                Value::Map(unprotected.clone()),
+                Value::Null,
+                Value::Bytes(signature.clone()),
+            ])),
+        );
+        let expected_bytes = c2pa_cbor::to_vec(&expected).unwrap();
+
+        for tagged in [false, true] {
+            for protected_array in [false, true] {
+                for signature_array in [false, true] {
+                    let mut value = Value::Array(vec![
+                        byte_field(&protected, protected_array),
+                        Value::Map(unprotected.clone()),
+                        Value::Null,
+                        byte_field(&signature, signature_array),
+                    ]);
+                    if tagged {
+                        value = Value::Tag(18, Box::new(value));
+                    }
+                    let extracted = super::extract_signer_binding_bytes(&value).unwrap();
+                    assert_eq!(extracted, expected_bytes);
+                    coset::CoseSign1::from_tagged_slice(&extracted).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extract_signer_binding_bytes_rejects_malformed_shapes() {
+        use c2pa_cbor::Value;
+
+        let valid = vec![
+            Value::Bytes(vec![0xa1, 0x01, 0x27]),
+            Value::Map(std::collections::BTreeMap::new()),
+            Value::Null,
+            Value::Bytes(vec![0xde, 0xad]),
+        ];
+        let mut malformed = vec![
+            Value::Tag(
+                18,
+                Box::new(Value::Tag(18, Box::new(Value::Array(valid.clone())))),
+            ),
+            Value::Tag(17, Box::new(Value::Array(valid.clone()))),
+            Value::Tag(18, Box::new(Value::Null)),
+            Value::Array(valid[..3].to_vec()),
+            Value::Array([valid.clone(), vec![Value::Null]].concat()),
+        ];
+        for (index, field) in [(1, Value::Array(vec![])), (2, Value::Bytes(vec![]))] {
+            let mut items = valid.clone();
+            items[index] = field;
+            malformed.push(Value::Array(items));
+        }
+        for index in [0, 3] {
+            for field in [
+                Value::Array(vec![cbor_int(-1)]),
+                Value::Array(vec![cbor_int(256)]),
+                Value::Array(vec![Value::Text("1".into())]),
+                Value::Array(vec![Value::Bool(true)]),
+                Value::Text("AA==".into()),
+                Value::Tag(18, Box::new(Value::Bytes(vec![]))),
+            ] {
+                let mut items = valid.clone();
+                items[index] = field;
+                malformed.push(Value::Array(items));
+            }
+        }
+        for value in malformed {
+            assert!(super::extract_signer_binding_bytes(&value).is_none());
+            assert!(super::extract_signer_binding_bytes(&Value::Tag(18, Box::new(value))).is_none());
+        }
+    }
+
+    #[test]
+    fn extract_signer_binding_bytes_returns_none_for_non_array_shapes() {
         // A bare bstr (the pre-§18.25 opaque form) is no longer accepted.
         assert_eq!(
             super::extract_signer_binding_bytes(&c2pa_cbor::Value::Bytes(vec![0xd2, 0x01])),
