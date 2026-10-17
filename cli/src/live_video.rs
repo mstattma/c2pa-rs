@@ -30,6 +30,9 @@ use c2pa::{
 };
 use serde::Serialize;
 
+#[path = "live_video_updates.rs"]
+mod updates;
+
 /// Shared prefix of the §19.7 live video status codes, used to pick them out of the tracker.
 const LIVEVIDEO_CODE_PREFIX: &str = "livevideo";
 
@@ -186,7 +189,11 @@ pub fn validate_live_video(
     context: &Arc<C2paContext>,
     init_path: &Path,
     segments_glob: &Path,
+    updates_path: Option<&Path>,
 ) -> Result<()> {
+    if let Some(path) = updates_path {
+        return validate_live_video_with_updates(context, init_path, segments_glob, path);
+    }
     let trust_configured = trust_material_configured(context.settings());
     let init_data = fs::read(init_path)
         .with_context(|| format!("Failed to read init segment: {init_path:?}"))?;
@@ -266,6 +273,99 @@ pub fn validate_live_video(
              {} continuity error(s)",
             failure_count
         )
+    }
+}
+
+fn validate_live_video_with_updates(
+    context: &Arc<C2paContext>,
+    init_path: &Path,
+    segments_glob: &Path,
+    schedule_path: &Path,
+) -> Result<()> {
+    // Schedule/settings errors are local configuration errors, not asset verdicts.
+    updates::require_verification(context)?;
+    let segments = collect_segments(init_path, segments_glob)?;
+    let plan = updates::load_plan(context, schedule_path, &segments)?;
+    let report = validate_update_timeline(context, init_path, &segments, &plan);
+    let valid = report.validation_state != "Invalid";
+    report.emit();
+    if valid {
+        eprintln!("\n{} segment(s) validated successfully.", segments.len());
+        Ok(())
+    } else {
+        let reason = report
+            .validation_results
+            .failure
+            .first()
+            .and_then(|status| status.explanation.as_deref())
+            .unwrap_or("VSI update timeline invalid");
+        bail!("Live video validation failed: {reason}")
+    }
+}
+
+fn validate_update_timeline(
+    context: &Arc<C2paContext>,
+    init_path: &Path,
+    segments: &[PathBuf],
+    plan: &[updates::Update],
+) -> LiveVideoReport {
+    let mut validator = LiveVideoValidator::new();
+    let mut tracker = StatusTracker::default();
+    if let Err(error) =
+        updates::install_context(context, init_path, &mut validator, &mut tracker, false)
+    {
+        eprintln!("Init FAIL: {init_path:?}: {error:#}");
+        return invalid_init_report(init_path, &tracker);
+    }
+    eprintln!("Init OK:   {init_path:?}");
+    eprintln!(
+        "Method:    {}",
+        method_label(&ValidationMethod::VerifiableSegmentInfo)
+    );
+    let mut ctx = ValidationCtx {
+        context,
+        validator: &mut validator,
+        tracker: &mut tracker,
+        trust_configured: true,
+    };
+    let mut reports = Vec::with_capacity(segments.len());
+    let mut pending = plan.iter().peekable();
+    for (index, segment) in segments.iter().enumerate() {
+        if let Some(update) = pending
+            .peek()
+            .filter(|update| update.segment_index == index)
+        {
+            if let Err(error) = update.install(ctx.validator, ctx.tracker) {
+                eprintln!("VSI update FAIL before {segment:?}: {error:#}");
+                let mut report = invalid_init_report(init_path, ctx.tracker);
+                report.method = Some(method_label(&ValidationMethod::VerifiableSegmentInfo));
+                report.segments = reports;
+                return report;
+            }
+            eprintln!("VSI update OK before {segment:?}: {:?}", update.init_path);
+            pending.next();
+        }
+        let outcome = validate_segment_vsi(&mut ctx, segment, Some(ValidationState::Trusted));
+        reports.push(SegmentReport {
+            path: segment.display().to_string(),
+            state: outcome.state,
+        });
+    }
+    let failures = collect_live_video_failures(ctx.tracker);
+    let stream_state = if failures.is_empty() {
+        fold_stream_state(
+            Some(ValidationState::Trusted),
+            reports.iter().map(|report| report.state),
+        )
+    } else {
+        ValidationState::Invalid
+    };
+    LiveVideoReport {
+        validation_state: state_name(stream_state),
+        method: Some(method_label(&ValidationMethod::VerifiableSegmentInfo)),
+        init_segment: init_path.display().to_string(),
+        segments: reports,
+        validation_results: ReportResults { failure: failures },
     }
 }
 
@@ -1100,8 +1200,12 @@ mod tests {
         init_data.extend(make_bmff_box(b"mdat"));
         let init = write_temp_file(&dir, "init.mp4", &init_data);
 
-        let result =
-            validate_live_video(&Arc::new(C2paContext::new()), &init, Path::new("seg_*.m4s"));
+        let result = validate_live_video(
+            &Arc::new(C2paContext::new()),
+            &init,
+            Path::new("seg_*.m4s"),
+            None,
+        );
 
         assert!(result.is_err());
         assert!(result
@@ -1124,8 +1228,12 @@ mod tests {
         let seg_data = make_bmff_box(b"mdat");
         write_temp_file(&dir, "seg_001.m4s", &seg_data);
 
-        let result =
-            validate_live_video(&Arc::new(C2paContext::new()), &init, Path::new("seg_*.m4s"));
+        let result = validate_live_video(
+            &Arc::new(C2paContext::new()),
+            &init,
+            Path::new("seg_*.m4s"),
+            None,
+        );
 
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
