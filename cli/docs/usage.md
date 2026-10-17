@@ -499,11 +499,93 @@ Either way, four sidecar names are recognised, and all of them are read for ever
 
 The `trust` subcommand's `--trust_anchors`, `--allowed_list` and `--trust_config` options cannot be combined with `live-video`, since a single invocation runs one subcommand. Anchors can also be embedded in the settings file's own `[trust]` section as inline PEM strings, which is what the SDK ultimately consumes, but the sidecars avoid pasting certificates into a configuration document.
 
+### Trusted local VSI init updates
+
+For an operator-controlled local recording with changing VSI init manifests,
+`live-video` optionally accepts a JSON schedule:
+
+```shell
+c2patool --settings trusted.toml stream/init-a.mp4 live-video \
+  --segments_glob "seg*.m4s" --updates stream/updates.json > report.json
+```
+
+```json
+{
+  "version": 1,
+  "updates": [
+    { "before_segment": "seg103.m4s", "init": "init-b.mp4" }
+  ]
+}
+```
+
+The schedule is limited to 1 MiB and 1024 updates. Version 1 is required;
+unknown, duplicate, missing or incorrectly typed fields are rejected. Each
+`before_segment` must be a unique exact filename matching exactly one selected
+media file. Directory components are rejected and glob syntax is not expanded.
+Events run in the selected media's natural filename order, regardless of their
+order in the JSON array. Relative
+init paths are resolved against the **schedule's parent directory**, not the
+initial init's directory. Absolute paths and parent-relative paths are allowed:
+the schedule is trusted local operator input, not a sandboxed network resource.
+An empty update list still opts into this stricter profile.
+
+Raw init snapshots are limited to 16 MiB each, with a cumulative 64 MiB budget
+for scheduled updates. The initial init has its own separate 16 MiB allowance.
+Every scheduled occurrence counts, even when several events reference the same
+file. Reads are capped at the smaller of the per-file limit and the remaining
+scheduled budget, plus one byte to detect overflow; file size metadata is not
+used to allocate an unchecked buffer. These are raw-byte limits, not a total
+process-memory cap.
+
+This profile requires `verify.verify_after_reading` and `verify.verify_trust`
+to remain enabled. The initial init and every replacement must have an
+**embedded signed VSI manifest**, validate as `Trusted`, and have no active
+manifest failures. Provision the appropriate trust anchors or allowed signing
+certificates in settings; a merely `Valid` untrusted init is insufficient here.
+Session keys, the nonempty manifest label (including legitimate v1 vendor
+labels), and the leaf certificate are extracted from the same verified Reader.
+Manifest Box streams, unsigned init assets, detached manifests and manifest
+discovery from media are not supported by `--updates`.
+
+Before an init's bytes reach Reader, a new Reader context is created from the
+current settings with only `verify.remote_manifest_fetch` disabled. This prevents
+asset-directed manifest fetching even for invalid init assets; checking for an
+embedded manifest afterward is additional defense, not the fetch guard. The
+caller's context and all other settings, including trust, hash verification and
+OCSP policy, remain unchanged.
+
+The plan loads and verifies bounded init snapshots in advance, retaining the
+verified bytes and their Reader-extracted material. Installation never reopens
+the init path, so changing or removing a scheduled file afterward cannot change
+the installed context. Read-ahead stops at the first failed snapshot; that
+failure is retained for the timeline's asset report rather than treated as a
+malformed schedule. Immediately before the named media file, the prepared init is
+installed using `LiveVideoValidator::update_vsi_context` on the **existing**
+validator. There is no validator reset or media retry. A rejected update stops
+the timeline before reading that media file or any later media. Asset read,
+trust, hard-binding and session-key failures produce an `Invalid` JSON report
+with recorded existing validation codes and the media rows completed so far.
+Malformed schedules and invalid verification settings are local configuration
+errors and may exit without an asset report. Progress, including update progress,
+goes only to stderr; stdout remains the same JSON report shape. Without
+`--updates`, the existing validation policy and output are unchanged.
+
+The upstream API variant preserves the previous accepted segment's strictly
+increasing sequence baseline and replaces the manifest/key context atomically.
+It does **not** provide the Castlabs fork's parsed-track/timing equivalence,
+EMSG-ID replay history, coverage or gap checks. Its optional init check rejects
+top-level `mdat`; it does not establish track, timescale, duration, codec or
+sample-entry equivalence. The operator owns logical-stream identity and update
+ordering/freshness. Old manifest contexts are not cached or retained for delayed
+media, and the schedule adds no restart/signing protocol or new standard failure
+codes. This is an experimental CLI profile, not an adopted C2PA update protocol.
+
 ### Additional options for live video
 
 | CLI option | Argument | Description |
 |-----|----|----|
 | `--segments_glob` | `<glob>` | Required with both `live-video` and `live-video-sign`. Glob pattern to find the media segments, resolved relative to the init segment's (or, for `live-video-sign`, the path argument's) directory, and matched in natural (numeric-aware) filename order. |
+| `--updates` | `<schedule.json>` | With `live-video` only: opt into the trusted local VSI init-update profile described above. |
 | `--init` | `<init_file>` | With `live-video-sign` (§19.3), optionally also signs the init segment. With `--method vsi`, the init segment is required (§19.4 mandates a signed manifest there). |
 | `--previous-segment` | `<segment_file>` | Resumes the continuity chain from a prior `live-video-sign` invocation's last signed segment, for a process that restarts mid-stream. With `--method vsi`, this also skips re-signing the init segment. |
 | `--method` | `manifest` &#124; `vsi` | Signing method for `live-video-sign` (default `manifest`). |
@@ -518,4 +600,3 @@ You can run the Wasm binary created for `wasm32-wasip2` directly with [wasmtime]
 ```
 wasmtime -S cli -S http --dir . c2patool.wasm [OPTIONS] <ASSET_PATH> [COMMAND]
 ```
-
