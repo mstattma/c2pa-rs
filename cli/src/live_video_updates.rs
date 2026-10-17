@@ -73,7 +73,9 @@ pub(super) fn require_verification(context: &C2paContext) -> Result<()> {
 }
 
 fn reader_context(context: &C2paContext) -> Result<Arc<C2paContext>> {
-    let settings = context.settings().clone()
+    let settings = context
+        .settings()
+        .clone()
         .with_value("verify.remote_manifest_fetch", false)?;
     Ok(Arc::new(C2paContext::new().with_settings(settings)?))
 }
@@ -99,7 +101,10 @@ fn capture_context(
 ) -> Result<Snapshot> {
     let init_data = read_snapshot(init_path, MAX_INIT_BYTES, remaining)?;
     let verified = read_context(context, init_path, &init_data)?;
-    Ok(Snapshot { init_data, verified })
+    Ok(Snapshot {
+        init_data,
+        verified,
+    })
 }
 
 fn read_context(
@@ -156,15 +161,18 @@ fn references(path: &Path, segments: &[PathBuf]) -> Result<Vec<(usize, PathBuf)>
     }
     // Derived struct deserializers can also accept positional arrays. Require JSON objects,
     // then deserialize the original bytes so duplicate fields still fail rather than collapse.
-    let shape: serde_json::Value = serde_json::from_slice(&bytes)
-        .context("Invalid VSI update schedule")?;
+    let shape: serde_json::Value =
+        serde_json::from_slice(&bytes).context("Invalid VSI update schedule")?;
     if !shape.is_object()
-        || shape.get("updates").and_then(serde_json::Value::as_array)
+        || shape
+            .get("updates")
+            .and_then(serde_json::Value::as_array)
             .is_some_and(|updates| updates.iter().any(|event| !event.is_object()))
     {
         bail!("VSI update schedule and its events must be JSON objects");
     }
-    let schedule: Schedule = serde_json::from_slice(&bytes).context("Invalid VSI update schedule")?;
+    let schedule: Schedule =
+        serde_json::from_slice(&bytes).context("Invalid VSI update schedule")?;
     if schedule.version != 1 {
         bail!("VSI update schedule version must be 1");
     }
@@ -220,7 +228,11 @@ fn load_plan_with_budget(
     for (segment_index, init_path) in references(path, segments)? {
         let snapshot = capture_context(context, &init_path, &mut remaining);
         let failed = snapshot.is_err();
-        plan.push(Update { segment_index, init_path, snapshot });
+        plan.push(Update {
+            segment_index,
+            init_path,
+            snapshot,
+        });
         // Preserve asset failures for the timeline's JSON report, but stop reading ahead.
         if failed {
             break;
@@ -262,7 +274,9 @@ fn install_snapshot(
 ) -> Result<()> {
     let failures_before = tracker.filter_errors().count();
     let result = (|| -> Result<()> {
-        let snapshot = snapshot.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        let snapshot = snapshot
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
         let verified = &snapshot.verified;
         if updating {
             validator.update_vsi_context(
@@ -289,7 +303,8 @@ fn install_snapshot(
     if let Err(error) = &result {
         if tracker.filter_errors().count() == failures_before {
             // Asset read/Reader errors must also appear in the standard JSON failure array.
-            let _ = validator.fail_init_manifest(format!("VSI init {init_path:?}: {error:#}"), tracker);
+            let _ =
+                validator.fail_init_manifest(format!("VSI init {init_path:?}: {error:#}"), tracker);
         }
     }
     result
@@ -330,16 +345,27 @@ mod tests {
     fn update_reader_disables_only_remote_manifest_fetch() {
         let trusted = trusted_context();
         for ocsp_fetch in [false, true] {
-            let settings = trusted.settings()
-                .with_value("verify.remote_manifest_fetch", true).unwrap()
-                .with_value("verify.ocsp_fetch", ocsp_fetch).unwrap()
-                .with_value("verify.verify_after_sign_hash", ocsp_fetch).unwrap();
+            let settings = trusted
+                .settings()
+                .with_value("verify.remote_manifest_fetch", true)
+                .unwrap()
+                .with_value("verify.ocsp_fetch", ocsp_fetch)
+                .unwrap()
+                .with_value("verify.verify_after_sign_hash", ocsp_fetch)
+                .unwrap();
             let context = C2paContext::new().with_settings(settings.clone()).unwrap();
             let isolated = reader_context(&context).unwrap();
-            assert_eq!(isolated.settings(), &settings
-                .with_value("verify.remote_manifest_fetch", false).unwrap());
+            assert_eq!(
+                isolated.settings(),
+                &settings
+                    .with_value("verify.remote_manifest_fetch", false)
+                    .unwrap()
+            );
             assert_eq!(context.settings(), &settings);
-            assert!(context.settings().get_value::<bool>("verify.remote_manifest_fetch").unwrap());
+            assert!(context
+                .settings()
+                .get_value::<bool>("verify.remote_manifest_fetch")
+                .unwrap());
         }
     }
 
@@ -367,21 +393,33 @@ mod tests {
     #[test]
     fn updates_flag_is_optional_and_scoped_to_live_video() {
         for updates in [None, Some("updates.json")] {
-            let mut args = vec!["c2patool", "init.mp4", "live-video", "--segments_glob", "seg*.m4s"];
+            let mut args = vec![
+                "c2patool",
+                "init.mp4",
+                "live-video",
+                "--segments_glob",
+                "seg*.m4s",
+            ];
             if let Some(path) = updates {
                 args.extend(["--updates", path]);
             }
             let args = crate::CliArgs::try_parse_from(args).unwrap();
             match args.command.unwrap() {
-                crate::Commands::LiveVideo { updates: actual, .. } => {
+                crate::Commands::LiveVideo {
+                    updates: actual, ..
+                } => {
                     assert_eq!(actual.as_deref(), updates.map(Path::new));
                 }
                 _ => panic!("expected live-video"),
             }
         }
         assert!(crate::CliArgs::try_parse_from([
-            "c2patool", "init.mp4", "--updates", "updates.json",
-        ]).is_err());
+            "c2patool",
+            "init.mp4",
+            "--updates",
+            "updates.json",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -425,33 +463,72 @@ mod tests {
         assert!(references(&path, &[]).is_ok());
         bytes.push(b' ');
         fs::write(&path, bytes).unwrap();
-        assert!(references(&path, &[]).unwrap_err().to_string().contains("1 MiB"));
+        assert!(references(&path, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("1 MiB"));
         let selected: Vec<_> = (0..=MAX_UPDATES)
-            .map(|index| PathBuf::from(format!("seg{index}.m4s"))).collect();
-        let events: Vec<_> = selected.iter()
-            .map(|path| event(path.to_str().unwrap(), Path::new("init.mp4"))).collect();
-        let path = schedule(&dir, json!({"version": 1, "updates": &events[..MAX_UPDATES]}));
+            .map(|index| PathBuf::from(format!("seg{index}.m4s")))
+            .collect();
+        let events: Vec<_> = selected
+            .iter()
+            .map(|path| event(path.to_str().unwrap(), Path::new("init.mp4")))
+            .collect();
+        let path = schedule(
+            &dir,
+            json!({"version": 1, "updates": &events[..MAX_UPDATES]}),
+        );
         assert_eq!(references(&path, &selected).unwrap().len(), MAX_UPDATES);
         let path = schedule(&dir, json!({"version": 1, "updates": events}));
-        assert!(references(&path, &selected).unwrap_err().to_string().contains("1024"));
+        assert!(references(&path, &selected)
+            .unwrap_err()
+            .to_string()
+            .contains("1024"));
     }
 
     #[test]
     fn targets_are_unique_exact_selected_filenames() {
         let dir = tempfile::tempdir().unwrap();
         let selected = vec![PathBuf::from("media/seg103.m4s")];
-        for name in ["", ".", "..", "./seg103.m4s", "../seg103.m4s", "media/seg103.m4s",
-            "media\\seg103.m4s", "C:seg103.m4s", "seg104.m4s", "SEG103.m4s", "seg*.m4s", "seg\0.m4s"] {
-            let path = schedule(&dir, json!({"version": 1, "updates": [event(name, Path::new("b.mp4"))]}));
+        for name in [
+            "",
+            ".",
+            "..",
+            "./seg103.m4s",
+            "../seg103.m4s",
+            "media/seg103.m4s",
+            "media\\seg103.m4s",
+            "C:seg103.m4s",
+            "seg104.m4s",
+            "SEG103.m4s",
+            "seg*.m4s",
+            "seg\0.m4s",
+        ] {
+            let path = schedule(
+                &dir,
+                json!({"version": 1, "updates": [event(name, Path::new("b.mp4"))]}),
+            );
             assert!(references(&path, &selected).is_err(), "accepted {name:?}");
         }
         let update = event("seg103.m4s", Path::new("b.mp4"));
-        let path = schedule(&dir, json!({"version": 1, "updates": [update.clone(), update.clone()]}));
-        assert!(references(&path, &selected).unwrap_err().to_string().contains("Duplicate"));
+        let path = schedule(
+            &dir,
+            json!({"version": 1, "updates": [update.clone(), update.clone()]}),
+        );
+        assert!(references(&path, &selected)
+            .unwrap_err()
+            .to_string()
+            .contains("Duplicate"));
         let path = schedule(&dir, json!({"version": 1, "updates": [update]}));
         let ambiguous = vec![selected[0].clone(), PathBuf::from("other/seg103.m4s")];
-        assert!(references(&path, &ambiguous).unwrap_err().to_string().contains("Ambiguous"));
-        let path = schedule(&dir, json!({"version": 1, "updates": [event("seg103.m4s", Path::new(""))]}));
+        assert!(references(&path, &ambiguous)
+            .unwrap_err()
+            .to_string()
+            .contains("Ambiguous"));
+        let path = schedule(
+            &dir,
+            json!({"version": 1, "updates": [event("seg103.m4s", Path::new(""))]}),
+        );
         assert!(references(&path, &selected).is_err());
     }
 
@@ -460,9 +537,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let absolute = dir.path().join("init-c.mp4");
         let selected = vec![PathBuf::from("seg2.m4s"), PathBuf::from("seg10.m4s")];
-        let path = schedule(&dir, json!({"version": 1, "updates": [
-            event("seg10.m4s", &absolute), event("seg2.m4s", Path::new("../init-b.mp4")),
-        ]}));
+        let path = schedule(
+            &dir,
+            json!({"version": 1, "updates": [
+                event("seg10.m4s", &absolute), event("seg2.m4s", Path::new("../init-b.mp4")),
+            ]}),
+        );
         let plan = references(&path, &selected).unwrap();
         assert_eq!(plan[0].0, 0);
         assert_eq!(plan[0].1, dir.path().join("../init-b.mp4"));
@@ -484,10 +564,18 @@ mod tests {
             }"#).unwrap();
         let signer = c2pa::create_signer::from_keys(
             include_bytes!("../sample/es256_certs.pem"),
-            include_bytes!("../sample/es256_private.key"), SigningAlg::Es256, None,
-        ).unwrap();
+            include_bytes!("../sample/es256_private.key"),
+            SigningAlg::Es256,
+            None,
+        )
+        .unwrap();
         assert!(signer.time_authority_url().is_none());
-        Arc::new(C2paContext::new().with_settings(settings).unwrap().with_signer(signer))
+        Arc::new(
+            C2paContext::new()
+                .with_settings(settings)
+                .unwrap()
+                .with_signer(signer),
+        )
     }
 
     // Public legacy TLS access is needed only for the baseline producer's internal Reader.
@@ -526,9 +614,14 @@ mod tests {
 
     fn producer(context: &C2paContext, minimum: u64, validity: u64) -> LiveVideoVsiSigner {
         LiveVideoVsiSigner::from_signing_key(
-            MANIFEST, context.signer().unwrap(), Ed25519SessionKey::from_bytes(&[0x42; 32]),
-            b"session-key".to_vec(), minimum, validity,
-        ).unwrap()
+            MANIFEST,
+            context.signer().unwrap(),
+            Ed25519SessionKey::from_bytes(&[0x42; 32]),
+            b"session-key".to_vec(),
+            minimum,
+            validity,
+        )
+        .unwrap()
     }
 
     fn make_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
@@ -552,22 +645,49 @@ mod tests {
         let _settings = ProducerSettings::new(context.settings());
         let dir = tempfile::tempdir().unwrap();
         let mut a = producer(&context, 102, 3600);
-        let init_a = a.sign_init_segment(INIT, "video/mp4", context.signer().unwrap()).unwrap();
-        fs::write(dir.path().join("seg102.m4s"), a.sign_media_segment(&media(102)).unwrap()).unwrap();
-        fs::write(dir.path().join("old103.m4s"), a.sign_media_segment(&media(103)).unwrap()).unwrap();
+        let init_a = a
+            .sign_init_segment(INIT, "video/mp4", context.signer().unwrap())
+            .unwrap();
+        fs::write(
+            dir.path().join("seg102.m4s"),
+            a.sign_media_segment(&media(102)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("old103.m4s"),
+            a.sign_media_segment(&media(103)).unwrap(),
+        )
+        .unwrap();
         let mut b = producer(&context, 102, validity_b);
-        let init_b = b.sign_init_segment(INIT, "video/mp4", context.signer().unwrap()).unwrap();
-        fs::write(dir.path().join("equal102.m4s"), b.sign_media_segment(&media(102)).unwrap()).unwrap();
-        fs::write(dir.path().join("seg103.m4s"), b.sign_media_segment(&media(103)).unwrap()).unwrap();
+        let init_b = b
+            .sign_init_segment(INIT, "video/mp4", context.signer().unwrap())
+            .unwrap();
+        fs::write(
+            dir.path().join("equal102.m4s"),
+            b.sign_media_segment(&media(102)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("seg103.m4s"),
+            b.sign_media_segment(&media(103)).unwrap(),
+        )
+        .unwrap();
         fs::write(dir.path().join("init-a.mp4"), init_a).unwrap();
         fs::write(dir.path().join("init-b.mp4"), init_b).unwrap();
-        let path = schedule(&dir, json!({"version": 1, "updates": [
-            event("seg103.m4s", Path::new("init-b.mp4")),
-        ]}));
+        let path = schedule(
+            &dir,
+            json!({"version": 1, "updates": [
+                event("seg103.m4s", Path::new("init-b.mp4")),
+            ]}),
+        );
         (dir, context, path)
     }
 
-    fn timeline(dir: &TempDir, context: &Arc<C2paContext>, path: &Path) -> super::super::LiveVideoReport {
+    fn timeline(
+        dir: &TempDir,
+        context: &Arc<C2paContext>,
+        path: &Path,
+    ) -> super::super::LiveVideoReport {
         let init = dir.path().join("init-a.mp4");
         let selected = super::super::collect_segments(&init, Path::new("seg*.m4s")).unwrap();
         let plan = load_plan(context, path, &selected).unwrap();
@@ -581,16 +701,25 @@ mod tests {
         let b = dir.path().join("init-b.mp4");
         let size = fs::metadata(&b).unwrap().len();
         let selected = vec![dir.path().join("seg103.m4s"), dir.path().join("seg104.m4s")];
-        let path = schedule(&dir, json!({"version": 1, "updates": [
-            event("seg103.m4s", Path::new("init-b.mp4")),
-            event("seg104.m4s", Path::new("init-b.mp4")),
-        ]}));
+        let path = schedule(
+            &dir,
+            json!({"version": 1, "updates": [
+                event("seg103.m4s", Path::new("init-b.mp4")),
+                event("seg104.m4s", Path::new("init-b.mp4")),
+            ]}),
+        );
         let exact = load_plan_with_budget(&context, &path, &selected, size * 2).unwrap();
         assert_eq!(exact.len(), 2);
         assert!(exact.iter().all(|update| update.snapshot.is_ok()));
         let short = load_plan_with_budget(&context, &path, &selected, size * 2 - 1).unwrap();
         assert!(short[0].snapshot.is_ok());
-        assert!(short[1].snapshot.as_ref().err().unwrap().to_string().contains("raw-byte limit"));
+        assert!(short[1]
+            .snapshot
+            .as_ref()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("raw-byte limit"));
         // The initial init has a separate allowance. The failed second snapshot is reported
         // at its boundary, before attempting to open the nonexistent seg104 media file.
         let report = super::super::validate_update_timeline(&context, &init, &selected, &short);
@@ -599,16 +728,23 @@ mod tests {
         assert_eq!(report.segments[0].state, ValidationState::Trusted);
         assert!(report.validation_results.failure.iter().any(|status| {
             status.code == "livevideo.manifest.invalid"
-                && status.explanation.as_deref().unwrap().contains("raw-byte limit")
+                && status
+                    .explanation
+                    .as_deref()
+                    .unwrap()
+                    .contains("raw-byte limit")
         }));
 
         let mut selected = selected;
         selected.push(dir.path().join("seg105.m4s"));
-        let path = schedule(&dir, json!({"version": 1, "updates": [
-            event("seg103.m4s", Path::new("init-b.mp4")),
-            event("seg104.m4s", Path::new("init-b.mp4")),
-            event("seg105.m4s", Path::new("not-read.mp4")),
-        ]}));
+        let path = schedule(
+            &dir,
+            json!({"version": 1, "updates": [
+                event("seg103.m4s", Path::new("init-b.mp4")),
+                event("seg104.m4s", Path::new("init-b.mp4")),
+                event("seg105.m4s", Path::new("not-read.mp4")),
+            ]}),
+        );
         let plan = load_plan_with_budget(&context, &path, &selected, size * 2 - 1).unwrap();
         assert_eq!(plan.len(), 2);
         assert!(plan[1].snapshot.is_err());
@@ -635,7 +771,10 @@ mod tests {
         let (dir, context, path) = signed_corpus(3600);
         let init = dir.path().join("init-a.mp4");
         super::super::validate_live_video(&context, &init, Path::new("seg102.m4s"), None).unwrap();
-        assert!(super::super::validate_live_video(&context, &init, Path::new("seg*.m4s"), None).is_err());
+        assert!(
+            super::super::validate_live_video(&context, &init, Path::new("seg*.m4s"), None)
+                .is_err()
+        );
         let report = timeline(&dir, &context, &path);
         assert_eq!(report.validation_state, "Trusted");
         assert_eq!(report.segments.len(), 2);
@@ -644,9 +783,11 @@ mod tests {
         assert_eq!(json["segments"][1]["state"], "Trusted");
         assert_eq!(json["validation_results"]["failure"], json!([]));
         assert_eq!(json.as_object().unwrap().len(), 5);
-        super::super::validate_live_video(&context, &init, Path::new("seg*.m4s"), Some(&path)).unwrap();
+        super::super::validate_live_video(&context, &init, Path::new("seg*.m4s"), Some(&path))
+            .unwrap();
         // A boundary before the first selected media still uses the already-initialized validator.
-        super::super::validate_live_video(&context, &init, Path::new("seg103.m4s"), Some(&path)).unwrap();
+        super::super::validate_live_video(&context, &init, Path::new("seg103.m4s"), Some(&path))
+            .unwrap();
     }
 
     #[test]
@@ -654,24 +795,63 @@ mod tests {
         let (dir, context, _) = signed_corpus(3600);
         let mut validator = LiveVideoValidator::new();
         let mut tracker = StatusTracker::default();
-        install_context(&context, &dir.path().join("init-a.mp4"), &mut validator, &mut tracker, false).unwrap();
-        validator.validate_verifiable_segment_info(&fs::read(dir.path().join("seg102.m4s")).unwrap(), &mut tracker).unwrap();
-        install_context(&context, &dir.path().join("init-b.mp4"), &mut validator, &mut tracker, true).unwrap();
+        install_context(
+            &context,
+            &dir.path().join("init-a.mp4"),
+            &mut validator,
+            &mut tracker,
+            false,
+        )
+        .unwrap();
+        validator
+            .validate_verifiable_segment_info(
+                &fs::read(dir.path().join("seg102.m4s")).unwrap(),
+                &mut tracker,
+            )
+            .unwrap();
+        install_context(
+            &context,
+            &dir.path().join("init-b.mp4"),
+            &mut validator,
+            &mut tracker,
+            true,
+        )
+        .unwrap();
         assert_eq!(tracker.filter_errors().count(), 0);
         // This is signed for B and within B's key bounds, but equals A's accepted sequence.
         // Its rejection is the baseline sequence rule, not a fork-only emsg-ID replay check.
-        validator.validate_verifiable_segment_info(&fs::read(dir.path().join("equal102.m4s")).unwrap(), &mut tracker).unwrap();
+        validator
+            .validate_verifiable_segment_info(
+                &fs::read(dir.path().join("equal102.m4s")).unwrap(),
+                &mut tracker,
+            )
+            .unwrap();
         assert_eq!(tracker.filter_errors().count(), 1);
-        assert!(tracker.filter_errors().any(|item| item.description.contains("strictly greater")));
-        validator.validate_verifiable_segment_info(&fs::read(dir.path().join("old103.m4s")).unwrap(), &mut tracker).unwrap();
-        assert!(tracker.filter_errors().any(|item| item.description.contains("manifestId")));
+        assert!(tracker
+            .filter_errors()
+            .any(|item| item.description.contains("strictly greater")));
+        validator
+            .validate_verifiable_segment_info(
+                &fs::read(dir.path().join("old103.m4s")).unwrap(),
+                &mut tracker,
+            )
+            .unwrap();
+        assert!(tracker
+            .filter_errors()
+            .any(|item| item.description.contains("manifestId")));
         let failures = tracker.filter_errors().count();
         let b = fs::read(dir.path().join("seg103.m4s")).unwrap();
-        validator.validate_verifiable_segment_info(&b, &mut tracker).unwrap();
+        validator
+            .validate_verifiable_segment_info(&b, &mut tracker)
+            .unwrap();
         assert_eq!(tracker.filter_errors().count(), failures);
-        validator.validate_verifiable_segment_info(&b, &mut tracker).unwrap();
+        validator
+            .validate_verifiable_segment_info(&b, &mut tracker)
+            .unwrap();
         assert_eq!(tracker.filter_errors().count(), failures + 1);
-        assert!(tracker.filter_errors().any(|item| item.description.contains("strictly greater")));
+        assert!(tracker
+            .filter_errors()
+            .any(|item| item.description.contains("strictly greater")));
     }
 
     #[test]
@@ -681,18 +861,39 @@ mod tests {
         assert!(read_context(&context, &b, &fs::read(&b).unwrap()).is_ok());
         let mut validator = LiveVideoValidator::new();
         let mut tracker = StatusTracker::default();
-        install_context(&context, &dir.path().join("init-a.mp4"), &mut validator, &mut tracker, false).unwrap();
-        validator.validate_verifiable_segment_info(&fs::read(dir.path().join("seg102.m4s")).unwrap(), &mut tracker).unwrap();
+        install_context(
+            &context,
+            &dir.path().join("init-a.mp4"),
+            &mut validator,
+            &mut tracker,
+            false,
+        )
+        .unwrap();
+        validator
+            .validate_verifiable_segment_info(
+                &fs::read(dir.path().join("seg102.m4s")).unwrap(),
+                &mut tracker,
+            )
+            .unwrap();
         assert!(install_context(&context, &b, &mut validator, &mut tracker, true).is_err());
         let failures = tracker.filter_errors().count();
         assert!(failures > 0);
-        validator.validate_verifiable_segment_info(&fs::read(dir.path().join("old103.m4s")).unwrap(), &mut tracker).unwrap();
+        validator
+            .validate_verifiable_segment_info(
+                &fs::read(dir.path().join("old103.m4s")).unwrap(),
+                &mut tracker,
+            )
+            .unwrap();
         assert_eq!(tracker.filter_errors().count(), failures);
         fs::write(dir.path().join("seg103.m4s"), b"must not be read").unwrap();
         let report = timeline(&dir, &context, &path);
         assert_eq!(report.validation_state, "Invalid");
         assert_eq!(report.segments.len(), 1);
-        assert!(report.validation_results.failure.iter().any(|status| status.code == "livevideo.sessionkey.invalid"));
+        assert!(report
+            .validation_results
+            .failure
+            .iter()
+            .any(|status| status.code == "livevideo.sessionkey.invalid"));
     }
 
     #[test]
@@ -701,11 +902,19 @@ mod tests {
         let b = dir.path().join("init-b.mp4");
         let original = fs::read(&b).unwrap();
         let mut tampered = original.clone();
-        let mvhd = tampered.windows(4).position(|window| window == b"mvhd").unwrap();
+        let mvhd = tampered
+            .windows(4)
+            .position(|window| window == b"mvhd")
+            .unwrap();
         assert_eq!(tampered[mvhd + 4], 0);
         tampered[mvhd + 27] ^= 1;
         fs::write(dir.path().join("seg103.m4s"), b"must not be read").unwrap();
-        for candidate in [Some(tampered), Some(INIT.to_vec()), Some(b"not BMFF".to_vec()), None] {
+        for candidate in [
+            Some(tampered),
+            Some(INIT.to_vec()),
+            Some(b"not BMFF".to_vec()),
+            None,
+        ] {
             if let Some(bytes) = candidate {
                 fs::write(&b, bytes).unwrap();
             } else {
@@ -716,10 +925,18 @@ mod tests {
             assert_eq!(report.segments.len(), 1);
             let json = serde_json::to_value(&report).unwrap();
             assert_eq!(json["validation_state"], "Invalid");
-            assert!(report.validation_results.failure.iter().any(|status| status.code == "livevideo.manifest.invalid"));
+            assert!(report
+                .validation_results
+                .failure
+                .iter()
+                .any(|status| status.code == "livevideo.manifest.invalid"));
             assert!(super::super::validate_live_video(
-                &context, &dir.path().join("init-a.mp4"), Path::new("seg*.m4s"), Some(&path),
-            ).is_err());
+                &context,
+                &dir.path().join("init-a.mp4"),
+                Path::new("seg*.m4s"),
+                Some(&path),
+            )
+            .is_err());
         }
     }
 
@@ -727,17 +944,24 @@ mod tests {
     fn initial_context_must_be_trusted_even_for_an_empty_schedule() {
         let (dir, context, _) = signed_corpus(3600);
         let path = schedule(&dir, json!({"version": 1, "updates": []}));
-        let anchorless = Arc::new(C2paContext::new().with_settings(
-            context.settings().with_value("trust.anchors", json!([])).unwrap(),
-        ).unwrap());
+        let anchorless = Arc::new(
+            C2paContext::new()
+                .with_settings(
+                    context
+                        .settings()
+                        .with_value("trust.anchors", json!([]))
+                        .unwrap(),
+                )
+                .unwrap(),
+        );
         let report = timeline(&dir, &anchorless, &path);
         assert_eq!(report.validation_state, "Invalid");
         assert!(report.segments.is_empty());
         assert!(!report.validation_results.failure.is_empty());
         for setting in ["verify.verify_after_reading", "verify.verify_trust"] {
-            let disabled = C2paContext::new().with_settings(
-                context.settings().with_value(setting, false).unwrap(),
-            ).unwrap();
+            let disabled = C2paContext::new()
+                .with_settings(context.settings().with_value(setting, false).unwrap())
+                .unwrap();
             assert!(require_verification(&disabled).is_err());
         }
         fs::write(dir.path().join("init-a.mp4"), INIT).unwrap();
@@ -747,24 +971,50 @@ mod tests {
     #[test]
     fn untrusted_update_does_not_reuse_the_initial_contexts_trust() {
         let (dir, context, path) = signed_corpus(3600);
-        let only_leaf = |pem: &str| json!([{
-            "trust_kind": "manifest", "trust_uri": "https://example.test/local-fixture",
-            "trust_anchors": "", "allowed_list": pem,
-            "trust_config": include_str!("../sample/store.cfg"),
-        }]);
-        let receiver = Arc::new(C2paContext::new().with_settings(
-            context.settings().with_value("trust.anchors", only_leaf(include_str!("../sample/es256_certs.pem"))).unwrap(),
-        ).unwrap());
+        let only_leaf = |pem: &str| {
+            json!([{
+                "trust_kind": "manifest", "trust_uri": "https://example.test/local-fixture",
+                "trust_anchors": "", "allowed_list": pem,
+                "trust_config": include_str!("../sample/store.cfg"),
+            }])
+        };
+        let receiver = Arc::new(
+            C2paContext::new()
+                .with_settings(
+                    context
+                        .settings()
+                        .with_value(
+                            "trust.anchors",
+                            only_leaf(include_str!("../sample/es256_certs.pem")),
+                        )
+                        .unwrap(),
+                )
+                .unwrap(),
+        );
         let other_signer = c2pa::create_signer::from_keys(
-            include_bytes!("../sample/ps256.pub"), include_bytes!("../sample/ps256.pem"),
-            SigningAlg::Ps256, None,
-        ).unwrap();
-        let signing = C2paContext::new().with_settings(
-            context.settings().with_value("trust.anchors", only_leaf(include_str!("../sample/ps256.pub"))).unwrap(),
-        ).unwrap().with_signer(other_signer);
+            include_bytes!("../sample/ps256.pub"),
+            include_bytes!("../sample/ps256.pem"),
+            SigningAlg::Ps256,
+            None,
+        )
+        .unwrap();
+        let signing = C2paContext::new()
+            .with_settings(
+                context
+                    .settings()
+                    .with_value(
+                        "trust.anchors",
+                        only_leaf(include_str!("../sample/ps256.pub")),
+                    )
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_signer(other_signer);
         let _settings = ProducerSettings::new(signing.settings());
         let mut b = producer(&signing, 103, 3600);
-        let signed = b.sign_init_segment(INIT, "video/mp4", signing.signer().unwrap()).unwrap();
+        let signed = b
+            .sign_init_segment(INIT, "video/mp4", signing.signer().unwrap())
+            .unwrap();
         fs::write(dir.path().join("init-b.mp4"), signed).unwrap();
         let report = timeline(&dir, &receiver, &path);
         assert_eq!(report.validation_state, "Invalid");
@@ -778,9 +1028,18 @@ mod tests {
     #[test]
     fn trusted_manifest_box_init_is_not_admitted_to_update_profile() {
         let context = trusted_context();
-        let mut builder = c2pa::Builder::from_shared_context(&context).with_definition(MANIFEST).unwrap();
+        let mut builder = c2pa::Builder::from_shared_context(&context)
+            .with_definition(MANIFEST)
+            .unwrap();
         let mut signed = Cursor::new(Vec::new());
-        builder.sign(context.signer().unwrap(), "video/mp4", &mut Cursor::new(INIT), &mut signed).unwrap();
+        builder
+            .sign(
+                context.signer().unwrap(),
+                "video/mp4",
+                &mut Cursor::new(INIT),
+                &mut signed,
+            )
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let init = dir.path().join("init-a.mp4");
         fs::write(&init, signed.into_inner()).unwrap();
@@ -788,7 +1047,11 @@ mod tests {
         let report = timeline(&dir, &context, &path);
         assert_eq!(report.validation_state, "Invalid");
         assert!(report.validation_results.failure.iter().any(|status| {
-            status.explanation.as_deref().unwrap().contains("not manifest-box streams")
+            status
+                .explanation
+                .as_deref()
+                .unwrap()
+                .contains("not manifest-box streams")
         }));
     }
 
@@ -800,10 +1063,17 @@ mod tests {
         definition["claim_version"] = json!(1);
         definition["vendor"] = json!("example");
         let mut signer = LiveVideoVsiSigner::from_signing_key(
-            definition.to_string(), context.signer().unwrap(), Ed25519SessionKey::from_bytes(&[0x42; 32]),
-            b"v1-key".to_vec(), 102, 3600,
-        ).unwrap();
-        let signed = signer.sign_init_segment(INIT, "video/mp4", context.signer().unwrap()).unwrap();
+            definition.to_string(),
+            context.signer().unwrap(),
+            Ed25519SessionKey::from_bytes(&[0x42; 32]),
+            b"v1-key".to_vec(),
+            102,
+            3600,
+        )
+        .unwrap();
+        let signed = signer
+            .sign_init_segment(INIT, "video/mp4", context.signer().unwrap())
+            .unwrap();
         let verified = read_context(&context, Path::new("init.mp4"), &signed).unwrap();
         assert!(!verified.manifest_id.is_empty());
         assert!(!verified.manifest_id.starts_with("urn:c2pa:"));

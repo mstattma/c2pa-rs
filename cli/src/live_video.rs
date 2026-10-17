@@ -331,7 +331,10 @@ fn validate_update_timeline(
     let mut reports = Vec::with_capacity(segments.len());
     let mut pending = plan.iter().peekable();
     for (index, segment) in segments.iter().enumerate() {
-        if let Some(update) = pending.peek().filter(|update| update.segment_index == index) {
+        if let Some(update) = pending
+            .peek()
+            .filter(|update| update.segment_index == index)
+        {
             if let Err(error) = update.install(ctx.validator, ctx.tracker) {
                 eprintln!("VSI update FAIL before {segment:?}: {error:#}");
                 let mut report = invalid_init_report(init_path, ctx.tracker);
