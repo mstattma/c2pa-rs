@@ -1132,7 +1132,12 @@ mod tests {
         let mut validator = LiveVideoValidator::new();
         let mut tracker = StatusTracker::default();
         validator
-            .validate_session_keys(&restored, TEST_MANIFEST_ID, Some(&ee_cert_der), &mut tracker)
+            .validate_session_keys(
+                &restored,
+                TEST_MANIFEST_ID,
+                Some(&ee_cert_der),
+                &mut tracker,
+            )
             .unwrap();
         assert_eq!(validator.session_keys.len(), 1);
         assert!(!tracker.logged_items().iter().any(|i| {
@@ -1442,7 +1447,9 @@ mod tests {
         }
         for value in malformed {
             assert!(super::extract_signer_binding_bytes(&value).is_none());
-            assert!(super::extract_signer_binding_bytes(&Value::Tag(18, Box::new(value))).is_none());
+            assert!(
+                super::extract_signer_binding_bytes(&Value::Tag(18, Box::new(value))).is_none()
+            );
         }
     }
 
