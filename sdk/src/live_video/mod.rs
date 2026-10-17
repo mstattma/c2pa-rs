@@ -137,6 +137,8 @@ pub struct LiveVideoValidator {
     ///
     /// [`validate_session_keys`]: LiveVideoValidator::validate_session_keys
     expected_manifest_id: Option<String>,
+    /// An accepted manifest-box segment rules out VSI-only context updates.
+    manifest_box_context: bool,
 }
 
 impl LiveVideoValidator {
@@ -145,6 +147,7 @@ impl LiveVideoValidator {
             previous_segment: None,
             session_keys: Vec::new(),
             expected_manifest_id: None,
+            manifest_box_context: false,
         }
     }
 
@@ -247,6 +250,7 @@ impl LiveVideoValidator {
             stream_id: assertion.stream_id.clone(),
             manifest_id: manifest_id.to_string(),
         });
+        self.manifest_box_context = true;
 
         Ok(())
     }
@@ -323,6 +327,89 @@ impl LiveVideoValidator {
         Ok(())
     }
 
+    /// Atomically replaces an initialized VSI manifest/key context, preserving the
+    /// previously accepted segment and its sequence-number continuity baseline.
+    ///
+    /// The caller must first verify the candidate manifest with [`crate::Reader`],
+    /// including signature, trust, assertion integrity and the applicable init hard
+    /// binding. `assertion`, `manifest_id` and `ee_cert_der` must come from that same
+    /// verified manifest. These raw arguments do not establish manifest trust or
+    /// logical-stream identity.
+    ///
+    /// Requires existing session keys and an expected manifest ID, and rejects a
+    /// validator that has accepted a per-segment Manifest Box. `Some(init)` runs the
+    /// existing init check (no top-level `mdat`); `None` skips it. No init layout is
+    /// stored, and track, timing and codec equivalence are not checked.
+    ///
+    /// Every candidate key must pass the existing session-key checks, with a nonempty,
+    /// unique resolved `kid`; `manifest_id` must be nonempty. This replaces all old
+    /// keys, rather than merging contexts. Key time/sequence applicability is still
+    /// checked when validating media, not by this update.
+    ///
+    /// `Ok(())` guarantees installation, even with an aggregating tracker. Any error
+    /// leaves validator state unchanged, but retains diagnostics in `tracker`. Only
+    /// new failures veto the update; earlier tracker failures do not. The legacy
+    /// setup methods and their result semantics are unchanged.
+    pub fn update_vsi_context(
+        &mut self,
+        init_segment: Option<&[u8]>,
+        assertion: &SessionKeys,
+        manifest_id: &str,
+        ee_cert_der: Option<&[u8]>,
+        tracker: &mut StatusTracker,
+    ) -> Result<()> {
+        if self.expected_manifest_id.is_none()
+            || self.session_keys.is_empty()
+            || self.manifest_box_context
+        {
+            fail_validation(
+                "VSI update requires existing session keys and a manifest ID outside the Manifest Box method",
+                LIVEVIDEO_SESSIONKEY_INVALID,
+                tracker,
+            )?;
+            return Err(Error::BadParam(
+                "VSI context update was not installed".into(),
+            ));
+        }
+
+        let failures_before = tracker.filter_errors().count();
+        let mut candidate = Self::new();
+        if let Some(init) = init_segment {
+            candidate.validate_init_segment(init, tracker)?;
+        }
+        if manifest_id.is_empty() {
+            fail_validation(
+                "VSI update requires a nonempty manifest ID",
+                LIVEVIDEO_SESSIONKEY_INVALID,
+                tracker,
+            )?;
+        }
+        let mut kids = std::collections::HashSet::new();
+        for key in &assertion.keys {
+            if !kid_from_cose_key(&key.key).is_some_and(|kid| !kid.is_empty() && kids.insert(kid)) {
+                fail_validation(
+                    "VSI update requires nonempty, unique session key identifiers",
+                    LIVEVIDEO_SESSIONKEY_INVALID,
+                    tracker,
+                )?;
+            }
+        }
+        candidate.validate_session_keys(assertion, manifest_id, ee_cert_der, tracker)?;
+        // Legacy checks may return Ok after logging failures or retaining only a subset.
+        if tracker.filter_errors().count() != failures_before
+            || candidate.session_keys.len() != assertion.keys.len()
+            || candidate.session_keys.is_empty()
+        {
+            return Err(Error::BadParam(
+                "VSI context update was not installed".into(),
+            ));
+        }
+
+        self.session_keys = candidate.session_keys;
+        self.expected_manifest_id = candidate.expected_manifest_id;
+        Ok(())
+    }
+
     /// Validates a media segment using the Verifiable Segment Info method ([§19.4]).
     ///
     /// [§19.4]: https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#verifiable_segment_info
@@ -371,3 +458,6 @@ impl Default for LiveVideoValidator {
 
 #[cfg(test)]
 mod test_helpers;
+
+#[cfg(test)]
+mod verified_updates_tests;
