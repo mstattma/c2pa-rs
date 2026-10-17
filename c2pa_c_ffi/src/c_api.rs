@@ -1226,6 +1226,91 @@ pub unsafe extern "C" fn c2pa_reader_with_fragment(
     box_tracked!(reader)
 }
 
+/// Configures an existing reader with one fragment cut out of a single-file
+/// fragmented BMFF asset, verified at its absolute byte offset in that asset.
+///
+/// This is the C entry point for `Reader::with_fragment_at_offset`. A
+/// single-file fragmented MP4 hashes its fragments with their absolute
+/// root-box offsets, so one byte-range segment of it only verifies when the
+/// verifier knows where the segment sat in the file. `fragment_offset` is the
+/// absolute byte offset of the first byte of `fragment` in the original asset.
+/// Passing `0` behaves like `c2pa_reader_with_fragment()`.
+///
+/// With the default exclusions, `stream` must hold every byte before the first
+/// C2PA `merkle` uuid box, and `fragment` must start at a `merkle` uuid box and
+/// end right before the next one (or at the end of the file). A `sidx` that
+/// sits before the next `moof` belongs to the earlier fragment. With a valid
+/// init and a parseable fragment, hash failures caused by a wrong cut or offset
+/// are reported as `assertion.bmffHash.mismatch` in the returned reader's
+/// validation results, not as NULL. Init-loading or fragment-parsing errors
+/// return NULL. The offset is supplied by the caller: it proves the bytes
+/// belong to the Merkle leaf they name, not where the caller fetched them.
+///
+/// Settings and trust come from `reader`; create it with
+/// `c2pa_reader_from_context()`. This method consumes the original reader and
+/// returns a new configured reader. Callers that load the library dynamically
+/// can probe for this entry point with
+/// `c2pa_reader_fragment_at_offset_supported()`.
+///
+/// # Safety
+///
+/// * `reader` must be a valid pointer to a C2paReader.
+/// * `format` must be a valid null-terminated string with the MIME type.
+/// * `stream` must be a valid pointer to a C2paStream (the initialization bytes).
+/// * `fragment` must be a valid pointer to a C2paStream (the fragment bytes).
+/// * `stream` and `fragment` must be distinct handles.
+/// * After calling this function, the `reader` pointer is INVALID, on success
+///   and on failure.
+///
+/// # Returns
+///
+/// A pointer to a newly configured C2paReader, or NULL on error.
+///
+/// # Example
+///
+/// ```c
+/// C2paReader* reader = c2pa_reader_from_context(ctx);
+/// C2paReader* new_reader = c2pa_reader_with_fragment_at_offset(
+///     reader, "video/mp4", init_stream, segment_stream, segment_offset);
+/// // reader is now invalid, use new_reader
+/// ```
+#[no_mangle]
+pub unsafe extern "C" fn c2pa_reader_with_fragment_at_offset(
+    reader: *mut C2paReader,
+    format: *const c_char,
+    stream: *mut C2paStream,
+    fragment: *mut C2paStream,
+    fragment_offset: u64,
+) -> *mut C2paReader {
+    // Take ownership of `reader` first so every early return below (ours or
+    // `with_fragment_at_offset`'s) drops it uniformly via scope-exit `Drop`.
+    let reader = untrack_or_return_null!(reader, C2paReader);
+
+    distinct_or_return_null!(stream, fragment);
+    let format = cstr_or_return_null!(format);
+    let mut stream = deref_mut_or_return_null!(stream, C2paStream);
+    let mut fragment = deref_mut_or_return_null!(fragment, C2paStream);
+
+    let reader = ok_or_return_null!(reader.with_fragment_at_offset(
+        &format,
+        &mut *stream,
+        &mut *fragment,
+        fragment_offset
+    ));
+    box_tracked!(reader)
+}
+
+/// Reports whether this library provides
+/// `c2pa_reader_with_fragment_at_offset()`.
+///
+/// Always returns `true` in builds that export it. Bindings that load the
+/// library dynamically and support older releases can resolve this symbol
+/// before calling the entry point; a missing symbol means unsupported.
+#[no_mangle]
+pub extern "C" fn c2pa_reader_fragment_at_offset_supported() -> bool {
+    true
+}
+
 /// Creates a new C2paReader from a shared Context.
 ///
 /// # Safety
@@ -5135,6 +5220,258 @@ verify_after_sign = true
             new_reader.is_null(),
             "Should return null for invalid format"
         );
+    }
+
+    /// Tests for `c2pa_reader_with_fragment_at_offset`. Upstream cannot yet
+    /// sign a single-file fragmented MP4 with per-fragment Merkle bindings, so
+    /// these use a signed multi-file fragment: it verifies at offset 0 (the
+    /// multi-file behavior) and is a hash mismatch at any other offset. The
+    /// offset arithmetic on single-file layouts is covered in the SDK's
+    /// `bmff_hash` tests.
+    mod fragment_at_offset {
+        use std::sync::OnceLock;
+
+        use super::*;
+
+        const SETTINGS: &str = include_str!(fixture_path!("test_settings.json"));
+
+        /// `(init, fragment)` of one bunny rendition signed with
+        /// `sign_fragmented_files`, signed once per test binary.
+        fn signed_fragment() -> &'static (Vec<u8>, Vec<u8>) {
+            static SIGNED: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
+            SIGNED.get_or_init(|| {
+                let context = c2pa::Context::new()
+                    .with_settings(SETTINGS)
+                    .unwrap()
+                    .into_shared();
+                let mut builder = c2pa::Builder::from_shared_context(&context);
+                builder.set_intent(c2pa::BuilderIntent::Create(c2pa::DigitalSourceType::Empty));
+                let input = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../sdk/tests/fixtures/bunny/bunny_89283bps/BigBuckBunny_2s_init.mp4");
+                let output = tempfile::tempdir().unwrap();
+                builder
+                    .sign_fragmented_files(
+                        context.signer().unwrap(),
+                        input.as_path(),
+                        std::path::Path::new("BigBuckBunny_2s1.m4s"),
+                        output.path(),
+                    )
+                    .unwrap();
+                let rendition = output.path().join("bunny_89283bps");
+                (
+                    std::fs::read(rendition.join("BigBuckBunny_2s_init.mp4")).unwrap(),
+                    std::fs::read(rendition.join("BigBuckBunny_2s1.m4s")).unwrap(),
+                )
+            })
+        }
+
+        fn test_context() -> (*mut C2paSettings, *mut C2paContext) {
+            let settings = unsafe { c2pa_settings_new() };
+            assert!(!settings.is_null());
+            let json = CString::new(SETTINGS).unwrap();
+            let format = CString::new("json").unwrap();
+            assert_eq!(
+                unsafe {
+                    c2pa_settings_update_from_string(settings, json.as_ptr(), format.as_ptr())
+                },
+                0
+            );
+            let context_builder = unsafe { c2pa_context_builder_new() };
+            assert!(!context_builder.is_null());
+            assert_eq!(
+                unsafe { c2pa_context_builder_set_settings(context_builder, settings) },
+                0
+            );
+            let context = unsafe { c2pa_context_builder_build(context_builder) };
+            assert!(!context.is_null());
+            (settings, context)
+        }
+
+        fn free_context(settings: *mut C2paSettings, context: *mut C2paContext) {
+            unsafe {
+                assert_eq!(c2pa_free(context as *const c_void), 0);
+                assert_eq!(c2pa_free(settings as *const c_void), 0);
+            }
+        }
+
+        /// Reads `fragment` at `offset` through the C ABI. Returns the reader
+        /// (the caller frees it) or NULL with the last error set.
+        fn read_at(
+            context: *mut C2paContext,
+            init: &[u8],
+            fragment: &[u8],
+            offset: u64,
+        ) -> *mut C2paReader {
+            let mut init_stream = TestStream::new(init.to_vec());
+            let mut fragment_stream = TestStream::new(fragment.to_vec());
+            let format = CString::new("video/mp4").unwrap();
+            let reader = unsafe { c2pa_reader_from_context(context) };
+            assert!(!reader.is_null());
+            // The streams are borrowed for the call only; they are dropped
+            // before the returned reader is inspected.
+            unsafe {
+                c2pa_reader_with_fragment_at_offset(
+                    reader,
+                    format.as_ptr(),
+                    init_stream.as_ptr(),
+                    fragment_stream.as_ptr(),
+                    offset,
+                )
+            }
+        }
+
+        /// The reader's failure codes, freeing the reader.
+        fn failure_codes(reader: *mut C2paReader) -> Vec<String> {
+            assert!(
+                !reader.is_null(),
+                "expected a reader: {:?}",
+                CimplError::last_message()
+            );
+            let codes = {
+                let guard = checkout_exclusive::<C2paReader>(reader).unwrap();
+                let reader: &C2paReader = &guard;
+                reader
+                    .validation_status()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| s.code().to_string())
+                    .collect()
+            };
+            assert_eq!(unsafe { c2pa_free(reader as *const c_void) }, 0);
+            codes
+        }
+
+        #[test]
+        fn test_reader_fragment_at_offset_probe() {
+            assert!(c2pa_reader_fragment_at_offset_supported());
+        }
+
+        #[test]
+        fn test_reader_with_fragment_at_offset_zero_matches_with_fragment() {
+            let (settings, context) = test_context();
+            let (init, fragment) = signed_fragment();
+
+            let at_offset = failure_codes(read_at(context, init, fragment, 0));
+            assert!(at_offset.is_empty(), "offset 0: {at_offset:?}");
+
+            // Same result as the multi-file entry point.
+            let mut init_stream = TestStream::new(init.clone());
+            let mut fragment_stream = TestStream::new(fragment.clone());
+            let format = CString::new("video/mp4").unwrap();
+            let reader = unsafe {
+                c2pa_reader_with_fragment(
+                    c2pa_reader_from_context(context),
+                    format.as_ptr(),
+                    init_stream.as_ptr(),
+                    fragment_stream.as_ptr(),
+                )
+            };
+            assert_eq!(failure_codes(reader), at_offset);
+
+            free_context(settings, context);
+        }
+
+        #[test]
+        fn test_reader_with_fragment_at_offset_reports_wrong_offset() {
+            let (settings, context) = test_context();
+            let (init, fragment) = signed_fragment();
+
+            for offset in [1, init.len() as u64, u64::from(u32::MAX) + 1] {
+                let codes = failure_codes(read_at(context, init, fragment, offset));
+                assert!(
+                    codes
+                        .iter()
+                        .any(|c| c == c2pa::validation_status::ASSERTION_BMFFHASH_MISMATCH),
+                    "offset {offset}: expected a BMFF hash mismatch, got {codes:?}"
+                );
+            }
+
+            free_context(settings, context);
+        }
+
+        #[test]
+        fn test_reader_with_fragment_at_offset_overflow_is_not_a_match() {
+            let (settings, context) = test_context();
+            let (init, fragment) = signed_fragment();
+
+            // Offset arithmetic overflows inside the verifier. The reader must
+            // not report the fragment as verified, whether the error surfaces
+            // as NULL or in the validation results.
+            let reader = read_at(context, init, fragment, u64::MAX);
+            if !reader.is_null() {
+                let codes = failure_codes(reader);
+                assert!(!codes.is_empty(), "u64::MAX offset reported no failure");
+            }
+
+            free_context(settings, context);
+        }
+
+        #[test]
+        fn test_reader_with_fragment_at_offset_rejects_invalid_args() {
+            let (settings, context) = test_context();
+            let format = CString::new("video/mp4").unwrap();
+            let mut init_stream = TestStream::new(vec![0; 8]);
+            let mut fragment_stream = TestStream::new(vec![0; 8]);
+
+            let reader = unsafe {
+                c2pa_reader_with_fragment_at_offset(
+                    std::ptr::null_mut(),
+                    format.as_ptr(),
+                    init_stream.as_ptr(),
+                    fragment_stream.as_ptr(),
+                    0,
+                )
+            };
+            assert!(reader.is_null());
+            assert_eq!(
+                CimplError::last_message().as_deref(),
+                Some("NullParameter: reader")
+            );
+
+            // Each case consumes the passed-in reader, on failure as on success.
+            let cases: [(*const c_char, *mut C2paStream, *mut C2paStream, &str); 4] = [
+                (
+                    std::ptr::null(),
+                    init_stream.as_ptr(),
+                    fragment_stream.as_ptr(),
+                    "NullParameter: format",
+                ),
+                (
+                    format.as_ptr(),
+                    std::ptr::null_mut(),
+                    fragment_stream.as_ptr(),
+                    "NullParameter: stream",
+                ),
+                (
+                    format.as_ptr(),
+                    init_stream.as_ptr(),
+                    std::ptr::null_mut(),
+                    "NullParameter: fragment",
+                ),
+                (
+                    format.as_ptr(),
+                    init_stream.as_ptr(),
+                    init_stream.as_ptr(),
+                    "Other: stream and fragment must be distinct handles",
+                ),
+            ];
+            for (format_ptr, stream, fragment, expected) in cases {
+                let reader = unsafe { c2pa_reader_from_context(context) };
+                assert!(!reader.is_null());
+                let result = unsafe {
+                    c2pa_reader_with_fragment_at_offset(reader, format_ptr, stream, fragment, 0)
+                };
+                assert!(result.is_null(), "{expected}: expected NULL");
+                assert_eq!(CimplError::last_message().as_deref(), Some(expected));
+            }
+
+            // An init stream without a manifest is an error, not a reader.
+            let result = read_at(context, &[0; 8], &[0; 8], 0);
+            assert!(result.is_null());
+            assert!(CimplError::last_message().is_some());
+
+            free_context(settings, context);
+        }
     }
 
     // ========== High-Value Coverage Tests ==========
