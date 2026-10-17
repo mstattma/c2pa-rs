@@ -508,7 +508,7 @@ mod tests {
                 &dir,
                 json!({"version": 1, "updates": [event(name, Path::new("b.mp4"))]}),
             );
-            assert!(references(&path, &selected).is_err(), "accepted {name:?}");
+            assert!(references(&path, &selected).is_err(), "accepted {:?}", name);
         }
         let update = event("seg103.m4s", Path::new("b.mp4"));
         let path = schedule(
