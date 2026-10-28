@@ -1229,21 +1229,31 @@ pub unsafe extern "C" fn c2pa_reader_with_fragment(
 /// Configures an existing reader with one fragment cut out of a single-file
 /// fragmented BMFF asset, verified at its absolute byte offset in that asset.
 ///
-/// This is the C entry point for `Reader::with_fragment_at_offset`. A
-/// single-file fragmented MP4 hashes its fragments with their absolute
-/// root-box offsets, so one byte-range segment of it only verifies when the
-/// verifier knows where the segment sat in the file. `fragment_offset` is the
-/// absolute byte offset of the first byte of `fragment` in the original asset.
+/// This is the C entry point for `Reader::with_fragment_at_offset`.
+/// `fragment_offset` is the absolute byte position of the supplied segment
+/// buffer's first byte in the original single-file signed asset. The verifier
+/// adds this offset to each included root box's position within the segment
+/// buffer to reproduce its signed position.
 /// Passing `0` behaves like `c2pa_reader_with_fragment()`.
 ///
-/// With the default exclusions, `stream` must hold every byte before the first
-/// C2PA `merkle` uuid box, and `fragment` must start at a `merkle` uuid box and
-/// end right before the next one (or at the end of the file). A `sidx` that
-/// sits before the next `moof` belongs to the earlier fragment. With a valid
-/// init and a parseable fragment, hash failures caused by a wrong cut or offset
-/// are reported as `assertion.bmffHash.mismatch` in the returned reader's
-/// validation results, not as NULL. Init-loading or fragment-parsing errors
-/// return NULL. The offset is supplied by the caller: it proves the bytes
+/// The buffer must contain the required Merkle information and reproduce the
+/// selected leaf's included bytes and root-box offsets. For the current
+/// default-exclusion layout, supply initialization bytes preceding the first
+/// Merkle UUID in `stream`, and a segment buffer running from a Merkle UUID
+/// to immediately before the next one, or through EOF for the last leaf.
+/// When a segment-local `sidx` is fully excluded by the signed assertion, the
+/// buffer may begin with that `sidx`; pass its absolute position as the
+/// starting offset. Other prefix boxes remain subject to their hash coverage.
+///
+/// specs-core#2642 (https://github.com/c2pa-org/specs-core/issues/2642) proposes
+/// segment-coherent hash boundaries. The offset parameter remains applicable
+/// wherever the binding includes absolute box positions.
+///
+/// With a valid init and a parseable fragment, hash failures caused by a wrong
+/// cut or offset are reported as `assertion.bmffHash.mismatch` in the reader's
+/// validation results. Segment-parsing failures are also reported through
+/// validation results; initialization-loading errors can return NULL.
+/// The offset is supplied by the caller: it proves the bytes
 /// belong to the Merkle leaf they name, not where the caller fetched them.
 ///
 /// Settings and trust come from `reader`; create it with
